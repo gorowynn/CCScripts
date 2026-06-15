@@ -1,0 +1,23 @@
+# Lua / CC:Tweaked
+*.luac
+*.out
+
+# luacheck (static analysis) cache
+.luacheckcache
+
+# LDoc generated docs
+doc/
+*.ldoc
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Local secrets / scratch
+.env
+scratch/
