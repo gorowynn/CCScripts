@@ -169,7 +169,43 @@ end
 local app, ui
 
 --===========================================================================
--- TEXT & TABLE LAYOUT  ·  word wrap + dynamic column widths, no truncation
+-- TOOL / ARMOR TIER DETECTION
+-- MineColonies tool/armor requests accept a range of material tiers. The
+-- request's `items` list holds each acceptable variant (e.g. iron_pickaxe,
+-- diamond_pickaxe). Parse the material from each registry name and return the
+-- min-max level range, or nil if this isn't a tool/armor request.
+--   Wood/Gold=1  Stone=2  Iron=3  Diamond=4  Netherite=5
+local TOOL_TIERS = {
+    wood = 1, wooden = 1, golden = 1, gold = 1,
+    stone = 2, iron = 3, chain = 3, chainmail = 3,
+    diamond = 4, netherite = 5,
+}
+local TOOL_TYPES = {
+    pickaxe = true, axe = true, shovel = true, hoe = true, sword = true,
+    helmet = true, chestplate = true, leggings = true, boots = true,
+    shield = true, bow = true, crossbow = true, fishing_rod = true,
+    shears = true, flint_and_steel = true,
+}
+local function tierInfo(items)
+    local minT, maxT, tname
+    for _, it in ipairs(asTable(items)) do
+        local reg = tostring(it.name or "")
+        -- strip namespace:  "minecraft:iron_pickaxe" -> "iron_pickaxe"
+        reg = reg:gsub("^[%w_]+:", "")
+        local mat, kind = reg:match("^(%a+)_(%a[%w_]*)$")
+        if mat and kind and TOOL_TYPES[kind] then
+            local tier = TOOL_TIERS[mat]
+            if tier then
+                tname = tname or kind
+                if minT == nil or tier < minT then minT = tier end
+                if maxT == nil or tier > maxT then maxT = tier end
+            end
+        end
+    end
+    if minT == nil then return nil end
+    return { min = minT, max = maxT, kind = tname or "tool" }
+end
+
 --===========================================================================
 
 -- Turn a raw registry/package name into something readable.
@@ -669,9 +705,23 @@ local function viewDashboard(bodyY)
     local reqH = H - 1 - reqY
     if reqH < 2 then reqH = 2 end
     -- group requests by source (the `target` field) before drawing the card
+    -- if a source name matches a citizen, append their job: Hammond (Forester)
+    local jobByName = {}
+    for _, c in ipairs(asTable(d.citizenList)) do
+        local jn = c.work and c.work.job
+        if c.name and jn then jobByName[tostring(c.name):lower()] = humanize(jn) end
+    end
+    local function resolveSource(raw)
+        local name = tostring(raw or "Unknown")
+        if name == "" then name = "Unknown" end
+        local h = humanize(name)
+        local job = jobByName[name:lower()]
+        if job then return h .. " (" .. job .. ")" end
+        return h
+    end
     local order, bySrc = {}, {}
     for _, r in ipairs(d.requests) do
-        local src = humanize(tostring(r.target or "Unknown"))
+        local src = resolveSource(r.target)
         if src == "" then src = "Unknown" end
         if not bySrc[src] then bySrc[src] = {}; order[#order + 1] = src end
         bySrc[src][#bySrc[src] + 1] = r
@@ -726,6 +776,17 @@ local function viewDashboard(bodyY)
                     qty = "?"
                 end
                 local item = qty .. " " .. nm        -- e.g. "1-64 Pumpkin"
+                -- for tool/armor requests, append the min-max tier range
+                local ti = tierInfo(r.items)
+                if ti then
+                    local lv
+                    if ti.min == ti.max then
+                        lv = " (Lv " .. ti.min .. ")"
+                    else
+                        lv = " (Lv " .. ti.min .. "-" .. ti.max .. ")"
+                    end
+                    item = item .. lv
+                end
                 -- tag prefix in state colour, item text in default text colour
                 local tagStr = "[" .. tag .. "] "
                 local itemMax = (W - 1) - (5 + #tagStr)
@@ -845,6 +906,8 @@ local function viewCitizens(bodyY)
           color = function() return THEME.text end },
         { header = "JOB",     align = "left",  wrap = false,
           color = function() return THEME.dim end },
+        { header = "STATUS",  align = "left",  wrap = false,
+          color = function(_, r) return r._statusCol end },
         { header = "HEALTH",  type = "bar", barW = 4,
           color = function(v) return ratioColour(v) end },
         { header = "MOOD",    type = "bar", barW = 4,
@@ -860,12 +923,20 @@ local function viewCitizens(bodyY)
         local hp = tonumber(c.health) or 0
         local hpMax = tonumber(c.maxHealth)
         if not hpMax or hpMax < 1 then hpMax = 20 end   -- sane default for citizens
+        -- current status: idle / asleep / needs food / the raw state string
+        local status, statusCol
+        if c.isIdle then status, statusCol = "Idle", THEME.warn
+        elseif c.isAsleep then status, statusCol = "Asleep", THEME.dim
+        elseif c.betterFood then status, statusCol = "Hungry", THEME.bad
+        else status, statusCol = humanize(tostring(c.state or "")), THEME.info end
         table.insert(rows, {
             c.name or "?",
             humanize(job),
+            status,
             clamp(hp / hpMax, 0, 1),
             clamp(mood / MOOD_MAX, 0, 1),
             clamp(food / FOOD_MAX, 0, 1),
+            _statusCol = statusCol,
         })
     end
     drawTable(2, bodyY, tableW, tableH, columns, rows, 3)
