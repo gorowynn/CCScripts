@@ -53,13 +53,13 @@ local THEME = {
 -- colour constant -> single hex char used by term.blit
 local BLIT = {}
 do
+    -- keys MUST match the CC:Tweaked `colors` API (American spelling):
+    -- gray / lightGray. (British `grey` lives only in the `colours` API.)
     local map = { white=0, orange=1, magenta=2, lightBlue=3, yellow=4, lime=5,
-        pink=6, grey=7, lightGrey=8, cyan=9, purple=10, blue=11, brown=12,
+        pink=6, gray=7, lightGray=8, cyan=9, purple=10, blue=11, brown=12,
         green=13, red=14, black=15 }
     for name, idx in pairs(map) do
         BLIT[colors[name]] = string.format("%x", idx)
-        if name == "grey"    then BLIT[colors.gray]      = string.format("%x", idx) end
-        if name == "lightGrey" then BLIT[colors.lightGray] = string.format("%x", idx) end
     end
 end
 local function B(c) return BLIT[c] or BLIT[colors.white] end  -- blit char for a colour
