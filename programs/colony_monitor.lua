@@ -164,6 +164,185 @@ local function ratioColour(ratio, invert)
     return THEME.bad
 end
 
+-- forward declarations (assigned in APP STATE) so the table renderer can use them
+local app, ui
+
+--===========================================================================
+-- TEXT & TABLE LAYOUT  ·  word wrap + dynamic column widths, no truncation
+--===========================================================================
+
+-- Turn a raw registry/package name into something readable.
+--   "com.minecolonies.buildings.GuardTower" -> "Guard Tower"
+--   "minecolonies:guard_tower"              -> "Guard Tower"
+-- Already-readable strings (no "." or ":") are returned untouched.
+local function humanize(s)
+    if s == nil then return "?" end
+    s = tostring(s)
+    if s == "" then return "?" end
+    if not s:find("[.:]") then return s end               -- already human text
+    -- strip to the segment after the last "." or ":"
+    local pos = 0
+    for i = #s, 1, -1 do
+        local c = s:sub(i, i)
+        if c == "." or c == ":" then pos = i; break end
+    end
+    s = s:sub(pos + 1)
+    s = s:gsub("_", " ")                                  -- snake_case -> spaces
+    s = s:gsub("(%l)(%u)", "%1 %2")                       -- lowerUpper -> lower Upper
+    s = s:gsub("(%u)(%u%l)", "%1 %2")                      -- acronymWord -> acronym Word
+    s = s:gsub("%s+", " ")                                -- collapse runs of spaces
+    s = s:gsub("^%s+", "")
+    s = s:gsub("(%a)(%w*)", function(a, rest)               -- Title Case each word
+        return a:upper() .. rest:lower()
+    end)
+    return s
+end
+
+-- split text into lines each <= maxW chars, on word boundaries; hard-split any
+-- single token longer than maxW. Never truncates.
+local function wrapText(text, maxW)
+    text = text or ""
+    if maxW <= 0 then return {} end
+    if #text <= maxW then return { text } end
+    local lines, line = {}, ""
+    for word in text:gmatch("%S+") do
+        if line == "" then
+            line = word
+        elseif #line + 1 + #word <= maxW then
+            line = line .. " " .. word
+        else
+            lines[#lines + 1] = line
+            line = word
+        end
+    end
+    if line ~= "" then lines[#lines + 1] = line end
+    -- hard-split any over-long single token
+    local out = {}
+    for _, l in ipairs(lines) do
+        if #l <= maxW then
+            out[#out + 1] = l
+        else
+            local i = 1
+            while i <= #l do
+                out[#out + 1] = l:sub(i, i + maxW - 1)
+                i = i + maxW
+            end
+        end
+    end
+    return out
+end
+
+-- compute column widths to fit available width w. If everything fits naturally,
+-- use the max-content widths; otherwise shrink the single "wrap" column and its
+-- text wraps onto multiple lines instead of being truncated.
+-- returns: widths[], wrapCi (the column index that must wrap, or nil)
+local function computeWidths(columns, rows, w)
+    local ncol = #columns
+    local gutter = 2
+    local wrapCi = nil
+    for ci, col in ipairs(columns) do if col.wrap then wrapCi = ci end end
+
+    local naturals = {}
+    for ci, col in ipairs(columns) do
+        local nw = #col.header
+        for _, row in ipairs(rows) do
+            local c = row[ci] or ""
+            if #c > nw then nw = #c end
+        end
+        naturals[ci] = nw
+    end
+    local totalNat = gutter * (ncol - 1)
+    for ci = 1, ncol do totalNat = totalNat + naturals[ci] end
+
+    if totalNat <= w then return naturals, nil end
+    if not wrapCi then return naturals, nil end           -- can't shrink: keep natural
+
+    local widths, used = {}, gutter * (ncol - 1)
+    for ci = 1, ncol do
+        if ci ~= wrapCi then widths[ci] = naturals[ci]; used = used + naturals[ci] end
+    end
+    widths[wrapCi] = math.max(6, w - used)
+    return widths, wrapCi
+end
+
+-- height (in lines) a single data row will occupy once laid out
+local function rowHeight(columns, dataRow, widths, wrapCi)
+    if not wrapCi then return 1 end
+    return #wrapText(dataRow[wrapCi] or "", widths[wrapCi])
+end
+
+-- render a dynamic-width table with height-based pagination.
+--   columns: { { header=, align="left"|"right", wrap=bool, color=fn(cell,row)->col } }
+--   rows:    list of tables with keys 1..ncol (plus any "_" extras for color fns)
+-- updates app.page[viewIdx] / ui.pages[viewIdx].
+local function drawTable(x, y, w, bodyH, columns, rows, viewIdx)
+    local ncol = #columns
+    local gutter = 2
+    local widths, wrapCi = computeWidths(columns, rows, w)
+
+    -- column left x positions
+    local cx = {}
+    local acc = x
+    for ci = 1, ncol do cx[ci] = acc; acc = acc + widths[ci] + gutter end
+
+    -- header row + underline
+    for ci, col in ipairs(columns) do
+        if col.align == "right" then
+            writeRight(cx[ci] + widths[ci] - 1, y, col.header, THEME.dim)
+        else
+            writeAt(cx[ci], y, col.header, THEME.dim)
+        end
+    end
+    fillRow(x, y + 1, w, THEME.faint)
+
+    local bodyStart = y + 2
+    local budget = bodyH - 2                              -- body lines available
+    if budget < 1 then
+        app.page[viewIdx] = 1; ui.pages[viewIdx] = 1; return
+    end
+
+    -- paginate by accumulated row heights
+    local pages, cur, starts = 1, 0, { 1 }
+    for i, dataRow in ipairs(rows) do
+        local rh = rowHeight(columns, dataRow, widths, wrapCi)
+        if cur > 0 and cur + rh > budget then
+            pages = pages + 1; starts[pages] = i; cur = rh
+        else
+            cur = cur + rh
+        end
+    end
+    app.page[viewIdx] = clamp(app.page[viewIdx] or 1, 1, pages)
+    ui.pages[viewIdx] = pages
+
+    local page = app.page[viewIdx]
+    local startIdx = starts[page]
+    local stopIdx  = (page < pages) and (starts[page + 1] - 1) or #rows
+
+    local row = bodyStart
+    for i = startIdx, stopIdx do
+        if row > y + bodyH - 1 then break end
+        local dataRow = rows[i]
+        local rh = rowHeight(columns, dataRow, widths, wrapCi)
+        for ci = 1, ncol do
+            local col = columns[ci]
+            local fg = (col.color and col.color(dataRow[ci], dataRow)) or THEME.text
+            local lines = (ci == wrapCi)
+                and wrapText(dataRow[ci] or "", widths[ci])
+                or  { dataRow[ci] or "" }
+            for li = 1, #lines do
+                local yy = row + li - 1
+                if yy > y + bodyH - 1 then break end
+                if col.align == "right" then
+                    writeRight(cx[ci] + widths[ci] - 1, yy, lines[li], fg)
+                else
+                    writeAt(cx[ci], yy, lines[li], fg)
+                end
+            end
+        end
+        row = row + rh
+    end
+end
+
 --===========================================================================
 -- COLONY DATA LAYER
 --===========================================================================
@@ -309,10 +488,10 @@ local VIEWS = {
     { key = "citizens",  name = "CITIZENS"  },
     { key = "research",  name = "RESEARCH"  },
 }
-local app = { view = 1, page = { 1, 1, 1, 1 } }  -- current view + page per view
+app = { view = 1, page = { 1, 1, 1, 1 } }  -- current view + page per view
 
 -- hit-test rectangles captured during the last render, for touch handling
-local ui = { tabs = {}, prev = nil, next = nil, pages = {} }
+ui = { tabs = {}, prev = nil, next = nil, pages = {} }
 
 --===========================================================================
 -- SHARED CHROME  ·  title bar, tab bar, footer
@@ -475,12 +654,16 @@ local function viewDashboard(bodyY)
             local stateCol = (st == "completed" or st == "resolved") and THEME.good
                          or (st == "inprogress" or st == "in progress") and THEME.warn
                          or THEME.info
-            writeAt(3, row, tostring(r.name or r.target or "?"), THEME.text)
+            local nm = humanize(tostring(r.name or r.target or "?"))
             local need = tostring(r.count or "?")
             if r.minCount and r.minCount ~= r.count then
                 need = need .. "/" .. tostring(r.minCount)
             end
-            writeRight(2 + (W - 2) - 1, row, need, stateCol)
+            -- name fills the space between x=3 and the right-aligned count
+            local nameMax = (W - 1) - 3 - #need - 1
+            if nameMax > 0 and #nm > nameMax then nm = nm:sub(1, nameMax) end
+            writeAt(3, row, nm, THEME.text)
+            writeRight(W - 1, row, need, stateCol)
             row = row + 1
         end
     end
@@ -493,47 +676,39 @@ local function viewBuildings(bodyY)
     local d = Colony.data
     if not d then return end
     local list = d.buildings
+    local tableW = W - 2
+    local tableH = H - bodyY - 1
 
-    local header = string.format("%-22s %-14s %-9s %-8s",
-        "BUILDING", "TYPE", "LEVEL", "STATUS")
-    writeAt(2, bodyY, header, THEME.dim)
-    fillRow(2, bodyY + 1, W - 2, THEME.faint)
-
-    local rowsAvail = H - bodyY - 3
-    local perPage = math.max(1, rowsAvail)
-    local pages = math.max(1, math.ceil(#list / perPage))
-    app.page[2] = clamp(app.page[2], 1, pages)
-    ui.pages[2] = pages
-
-    local start = (app.page[2] - 1) * perPage
-    local row = bodyY + 2
-    for i = start + 1, math.min(#list, start + perPage) do
-        if row > H - 1 then break end
-        local b = list[i]
-        -- level gauge: level/maxLevel
+    local columns = {
+        { header = "BUILDING", align = "left",  wrap = true,
+          color = function() return THEME.text end },
+        { header = "TYPE",     align = "left",  wrap = false,
+          color = function() return THEME.dim end },
+        { header = "LEVEL",    align = "right", wrap = false,
+          color = function(_, r) return ratioColour(r._ratio) end },
+        { header = "STATUS",   align = "right", wrap = false,
+          color = function(_, r) return r._stCol end },
+    }
+    local rows = {}
+    for _, b in ipairs(list) do
         local lvl = tonumber(b.level) or 0
         local maxL = tonumber(b.maxLevel) or 1
         if maxL < 1 then maxL = 1 end
-        local ratio = lvl / maxL
-        -- name + type
-        local nm = (b.name or "?")
-        if #nm > 21 then nm = nm:sub(1, 20) .. "~" end
-        local ty = (b.type or "?")
-        if #ty > 14 then ty = ty:sub(1, 13) .. "~" end
-        writeAt(2, row, nm, THEME.text)
-        writeAt(2 + 23, row, ty, THEME.dim)
-        -- level label
-        local lvlTxt = "Lv " .. lvl .. "/" .. maxL
-        writeAt(2 + 23 + 15, row, lvlTxt, ratioColour(ratio))
-        -- status flags as tiny LED + label
-        local st, stCol
-        if b.isWorkingOn then st, stCol = "BUILDING", THEME.warn
-        elseif not b.built then st, stCol = "RUIN", THEME.bad
-        else st, stCol = "OK", THEME.good end
-        local guard = b.guarded and " G" or ""
-        writeRight(W - 1, row, st .. guard, stCol)
-        row = row + 1
+        local stTxt, stCol
+        if b.isWorkingOn then stTxt, stCol = "BUILDING", THEME.warn
+        elseif not b.built then stTxt, stCol = "RUIN", THEME.bad
+        else stTxt, stCol = "OK", THEME.good end
+        if b.guarded then stTxt = stTxt .. " (G)" end
+        table.insert(rows, {
+            humanize(b.name),
+            humanize(b.type),
+            string.format("%d/%d", lvl, maxL),
+            stTxt,
+            _ratio = lvl / maxL,
+            _stCol = stCol,
+        })
     end
+    drawTable(2, bodyY, tableW, tableH, columns, rows, 2)
     if #list == 0 then
         writeAt(3, bodyY + 2, "No buildings found", THEME.dim)
     end
@@ -546,43 +721,39 @@ local function viewCitizens(bodyY)
     local d = Colony.data
     if not d then return end
     local list = d.citizenList
+    local tableW = W - 2
+    local tableH = H - bodyY - 1
 
-    local header = string.format("%-18s %-14s %-12s %-7s %-7s",
-        "CITIZEN", "JOB", "STATE", "MOOD", "FOOD")
-    writeAt(2, bodyY, header, THEME.dim)
-    fillRow(2, bodyY + 1, W - 2, THEME.faint)
-
-    local rowsAvail = H - bodyY - 3
-    local perPage = math.max(1, rowsAvail)
-    local pages = math.max(1, math.ceil(#list / perPage))
-    app.page[3] = clamp(app.page[3], 1, pages)
-    ui.pages[3] = pages
-
-    local start = (app.page[3] - 1) * perPage
-    local row = bodyY + 2
-    for i = start + 1, math.min(#list, start + perPage) do
-        if row > H - 1 then break end
-        local c = list[i]
-        local nm = c.name or "?"
-        if #nm > 17 then nm = nm:sub(1, 16) .. "~" end
-        local job = (c.work and c.work.job) or (c.state and c.state ~= "" and c.state) or "—"
-        if #job > 14 then job = job:sub(1, 13) .. "~" end
-        local stTxt = c.state or "—"
-        if #stTxt > 12 then stTxt = stTxt:sub(1, 11) .. "~" end
-
-        writeAt(2, row, nm, THEME.text)
-        writeAt(2 + 19, row, job, THEME.dim)
-        writeAt(2 + 19 + 15, row, stTxt, c.isIdle and THEME.warn or THEME.info)
-
-        -- mood (happiness ~0..10)
+    local columns = {
+        { header = "CITIZEN", align = "left",  wrap = true,
+          color = function() return THEME.text end },
+        { header = "JOB",     align = "left",  wrap = false,
+          color = function() return THEME.dim end },
+        { header = "STATE",   align = "left",  wrap = false,
+          color = function(_, r) return r._stCol end },
+        { header = "MOOD",    align = "right", wrap = false,
+          color = function(_, r) return ratioColour((r._mood or 0) / 10) end },
+        { header = "FOOD",    align = "right", wrap = false,
+          color = function(_, r) return r._foodCol end },
+    }
+    local rows = {}
+    for _, c in ipairs(list) do
+        local job = (c.work and c.work.job) or "—"
         local mood = tonumber(c.happiness) or 0
-        writeAt(2 + 19 + 15 + 13, row, string.format("%.1f", mood), ratioColour(mood / 10))
-        -- food (saturation)
         local food = tonumber(c.saturation) or 0
         local foodCol = food < 3 and THEME.bad or (food < 6 and THEME.warn or THEME.good)
-        writeRight(W - 1, row, string.format("%.1f", food), foodCol)
-        row = row + 1
+        table.insert(rows, {
+            c.name or "?",
+            humanize(job),
+            humanize(c.state or "—"),
+            string.format("%.1f", mood),
+            string.format("%.1f", food),
+            _stCol = c.isIdle and THEME.warn or THEME.info,
+            _mood = mood,
+            _foodCol = foodCol,
+        })
     end
+    drawTable(2, bodyY, tableW, tableH, columns, rows, 3)
     if #list == 0 then
         writeAt(3, bodyY + 2, "No citizens found", THEME.dim)
     end
@@ -629,16 +800,17 @@ local function viewResearch(bodyY)
         -- branch header when the branch changes
         if r.branch ~= curBranch then
             curBranch = r.branch
-            writeAt(2, row, string.upper(tostring(curBranch)), THEME.accent)
+            writeAt(2, row, string.upper(humanize(tostring(curBranch))), THEME.accent)
             row = row + 1
             if row > H - 1 then break end
         end
         local indent = 2 + r.depth * 2
         local st = researchState(node)
         led(indent, row, nil, st)
-        local nm = node.name or "?"
+        local nm = humanize(node.name or "?")
+        -- leave room for the right-aligned progress column; clean clip, no "~"
         local avail = W - indent - 12
-        if #nm > avail then nm = nm:sub(1, avail - 1) .. "~" end
+        if avail > 0 and #nm > avail then nm = nm:sub(1, avail) end
         writeAt(indent + 1, row, nm, st == "done" and THEME.dim or THEME.text)
         -- progress %
         local p = tonumber(node.progress) or 0
