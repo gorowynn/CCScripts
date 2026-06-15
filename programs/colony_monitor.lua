@@ -524,32 +524,48 @@ local function researchState(node)
     return "avail"
 end
 
-local function flattenResearch(research)
-    local rows, idx = {}, 1
-    local function add(branch, node, depth)
-        if type(node) ~= "table" or not node.name then return end
-        rows[idx] = { branch = branch, depth = depth, node = node }
-        idx = idx + 1
-        for _, child in ipairs(asTable(node.children)) do
-            add(branch, child, depth + 1)
+local function buildBranches(research)
+    -- returns a list of { name, nodes, counts } where nodes is a depth-tagged
+    -- flattened list and counts = { total, done, prog, avail }
+    local function flatten(raw, depth, list)
+        if type(raw) ~= "table" or not raw.name then return end
+        local st = researchState(raw)
+        list[#list + 1] = {
+            label = humanize(raw.name or "?"),
+            depth = depth,
+            status = st,
+            progress = tonumber(raw.progress) or 0,
+        }
+        for _, ch in ipairs(asTable(raw.children)) do
+            flatten(ch, depth + 1, list)
         end
     end
-    -- research root = { branchName = { node, node, ... } }
-    for branch, nodes in pairs(asTable(research)) do
-        if type(nodes) == "table" then
-            -- nodes might be an array of nodes, or a single node with children
-            if nodes.name then
-                add(branch, nodes, 0)
+
+    local names = {}
+    for k in pairs(asTable(research)) do names[#names + 1] = k end
+    table.sort(names)
+
+    local branches = {}
+    for _, bname in ipairs(names) do
+        local rootsRaw = research[bname]
+        if type(rootsRaw) == "table" then
+            local nodes = {}
+            if rootsRaw.name then
+                flatten(rootsRaw, 0, nodes)
             else
-                for _, node in ipairs(nodes) do add(branch, node, 0) end
+                for _, r in ipairs(rootsRaw) do flatten(r, 0, nodes) end
+            end
+            if #nodes > 0 then
+                local counts = { total = #nodes, done = 0, prog = 0, avail = 0 }
+                for _, n in ipairs(nodes) do
+                    counts[n.status] = (counts[n.status] or 0) + 1
+                end
+                branches[#branches + 1] =
+                    { name = humanize(bname), nodes = nodes, counts = counts }
             end
         end
     end
-    table.sort(rows, function(a, b)
-        if a.branch ~= b.branch then return a.branch < b.branch end
-        return false
-    end)
-    return rows
+    return branches
 end
 
 --===========================================================================
@@ -561,7 +577,7 @@ local VIEWS = {
     { key = "citizens",  name = "CITIZENS"  },
     { key = "research",  name = "RESEARCH"  },
 }
-app = { view = 1, page = { 1, 1, 1, 1 }, pan = { x = 0, y = 0 } }  -- view, per-view page, research pan
+app = { view = 1, page = { 1, 1, 1, 1 }, expanded = {} }  -- view, per-view page, expanded research branches
 
 -- hit-test rectangles captured during the last render, for touch handling
 ui = { tabs = {}, prev = nil, next = nil, pages = {}, body = nil, research = nil, footer = nil }
@@ -1020,209 +1036,91 @@ local function viewCitizens(bodyY)
 end
 
 --===========================================================================
--- RESEARCH TREE  ·  box-drawing junctions + 2D node layout
---===========================================================================
-local R_BOX_H, R_PAD, R_HGAP, R_VGAP = 3, 2, 4, 4   -- box height, text pad, h-gap, v-gap
-
--- map of (up/down/left/right connections) -> junction glyph
-local JUNCTION = {}
-do
-    local function set(u, d, l, r, ch)
-        JUNCTION[(u and 1 or 0) .. (d and 1 or 0) .. (l and 1 or 0) .. (r and 1 or 0)] = ch
-    end
-    set(true,  true,  true,  true,  "┼")
-    set(true,  true,  true,  false, "┤")
-    set(true,  true,  false, true,  "├")
-    set(true,  false, true,  true,  "┴")
-    set(false, true,  true,  true,  "┬")
-    set(true,  true,  false, false, "│")
-    set(false, false, true,  true,  "─")
-    set(true,  false, false, true,  "└")
-    set(true,  false, true,  false, "┘")
-    set(false, true,  false, true,  "┌")
-    set(false, true,  true,  false, "┐")
-    set(true,  false, false, false, "│")
-    set(false, true,  false, false, "│")
-    set(false, false, false, true,  "─")
-    set(false, false, true,  false, "─")
-end
-local function junctionChar(u, d, l, r)
-    return JUNCTION[(u and 1 or 0) .. (d and 1 or 0) .. (l and 1 or 0) .. (r and 1 or 0)] or " "
-end
-
--- lay out the research forest into positioned nodes within a virtual canvas.
--- returns branches (each: name, headerY, nodes[]) + canvas {w,h}
-local function layoutResearch(research)
-    local function makeNode(raw, depth)
-        local n = {
-            label = humanize(raw.name or "?"),
-            depth = depth,
-            status = researchState(raw),
-            progress = tonumber(raw.progress) or 0,
-            children = {},
-        }
-        n.bw = math.max(6, #n.label + R_PAD * 2)
-        for _, ch in ipairs(asTable(raw.children)) do
-            n.children[#n.children + 1] = makeNode(ch, depth + 1)
-        end
-        return n
-    end
-    local function subtreeW(n)
-        if #n.children == 0 then n.sw = n.bw; return n.bw end
-        local total = 0
-        for _, c in ipairs(n.children) do total = total + subtreeW(c) + R_HGAP end
-        n.sw = math.max(n.bw, total - R_HGAP)
-        return n.sw
-    end
-    local function assignXY(n, left, top)
-        n.x = left + math.floor((n.sw - n.bw) / 2)
-        n.y = top
-        local cl = left
-        for _, c in ipairs(n.children) do
-            assignXY(c, cl, top + R_BOX_H + R_VGAP)
-            cl = cl + c.sw + R_HGAP
-        end
-    end
-    local function gather(n, list)
-        list[#list + 1] = n
-        for _, c in ipairs(n.children) do gather(c, list) end
-    end
-
-    local names = {}
-    for k in pairs(asTable(research)) do names[#names + 1] = k end
-    table.sort(names)
-
-    local branches, canvasW, canvasH, curY = {}, 1, 1, 0
-    for _, bname in ipairs(names) do
-        local rootsRaw = research[bname]
-        local rawRoots = {}
-        if type(rootsRaw) == "table" then
-            if rootsRaw.name then rawRoots = { rootsRaw }
-            else for _, r in ipairs(rootsRaw) do rawRoots[#rawRoots + 1] = r end end
-        end
-        local roots = {}
-        for _, r in ipairs(rawRoots) do roots[#roots + 1] = makeNode(r, 0) end
-        if #roots > 0 then
-            for _, r in ipairs(roots) do subtreeW(r) end
-            local forestW = 0
-            for _, r in ipairs(roots) do forestW = forestW + r.sw + R_HGAP end
-            forestW = math.max(1, forestW - R_HGAP)
-
-            local headerY, treeTopY = curY, curY + 1
-            local rl, nodes, maxBottom = 0, {}, treeTopY + R_BOX_H
-            for _, r in ipairs(roots) do
-                assignXY(r, rl, treeTopY)
-                rl = rl + r.sw + R_HGAP
-                gather(r, nodes)
-            end
-            for _, n in ipairs(nodes) do
-                local b = n.y + R_BOX_H
-                if b > maxBottom then maxBottom = b end
-            end
-            branches[#branches + 1] = { name = humanize(bname), headerY = headerY, nodes = nodes }
-            if forestW > canvasW then canvasW = forestW end
-            if maxBottom > canvasH then canvasH = maxBottom end
-            curY = maxBottom + 2
-        end
-    end
-    return branches, { w = canvasW, h = canvasH }
-end
-
---===========================================================================
--- VIEW 4  ·  RESEARCH  (real tree with nodes + connectors, touch-panned)
+-- VIEW 4  ·  RESEARCH  (collapsible branches, ASCII-only, touch to expand)
 --===========================================================================
 local function viewResearch(bodyY)
     local d = Colony.data
     if not d then return end
-    local branches, canvas = layoutResearch(d.research)
+    local branches = buildBranches(d.research)
     if #branches == 0 then
         writeAt(3, bodyY, "No research data available", THEME.dim)
         ui.pages[4] = 1
         return
     end
 
-    local x0, y0 = 2, bodyY
-    local x1, y1 = W - 1, H - 1
-    local vw, vh = x1 - x0 + 1, y1 - y0 + 1
-    local maxX, maxY = math.max(0, canvas.w - vw), math.max(0, canvas.h - vh)
-    app.pan.x = clamp(app.pan.x, 0, maxX)
-    app.pan.y = clamp(app.pan.y, 0, maxY)
-    local panX, panY = app.pan.x, app.pan.y
-
-    local function sx(vx) return x0 + vx - panX end
-    local function sy(vy) return y0 + vy - panY end
+    local x0, x1 = 2, W - 1
+    local innerW = x1 - x0
     local function stCol(st)
         if st == "done" then return THEME.good end
         if st == "prog" then return THEME.warn end
         return THEME.info
     end
+    local function stTag(st)
+        if st == "done" then return "DONE" end
+        if st == "prog" then return "WIP" end
+        return "OPEN"
+    end
 
-    -- connectors (drawn first, so node boxes sit on top) ----------------
+    -- build display lines: collapsed branch summaries + expanded branch nodes
+    local lines = {}
     for _, br in ipairs(branches) do
-        for _, n in ipairs(br.nodes) do
-            if #n.children > 0 then
-                local pcx = n.x + math.floor(n.bw / 2)
-                local busY = n.y + R_BOX_H + math.floor(R_VGAP / 2) - 1
-                local cxs = {}
-                for _, c in ipairs(n.children) do
-                    cxs[#cxs + 1] = { x = c.x + math.floor(c.bw / 2), top = c.y }
-                end
-                table.sort(cxs, function(a, b) return a.x < b.x end)
-                local leftX, rightX = cxs[1].x, cxs[#cxs].x
-                for r = n.y + R_BOX_H, busY - 1 do
-                    writeAt(sx(pcx), sy(r), "│", THEME.faint)
-                end
-                for x = leftX, rightX do
-                    local u, dn = (x == pcx), false
-                    for _, c in ipairs(cxs) do if c.x == x then dn = true end end
-                    writeAt(sx(x), sy(busY),
-                        junctionChar(u, dn, x > leftX, x < rightX), THEME.faint)
-                end
-                for _, c in ipairs(cxs) do
-                    for r = busY + 1, c.top - 1 do
-                        writeAt(sx(c.x), sy(r), "│", THEME.faint)
-                    end
-                end
+        local isExp = app.expanded[br.name]
+        local marker = isExp and "v" or ">"
+        local c = br.counts
+        local nm = string.upper(br.name)
+        if #nm > 12 then nm = nm:sub(1, 12) end
+        local summary = string.format("%s %-12s  %2d nodes  %2d done  %2d wip  %2d open",
+            marker, nm, c.total, c.done, c.prog, c.avail)
+        lines[#lines + 1] = { text = summary, fg = THEME.accent,
+                              kind = "branch", name = br.name }
+        if isExp then
+            for _, n in ipairs(br.nodes) do
+                local indent = string.rep("  ", n.depth + 1)
+                local rightTxt = stTag(n.status) .. " " ..
+                    string.format("%3d%%", math.floor(n.progress * 100))
+                lines[#lines + 1] = {
+                    text = indent .. n.label,
+                    fg = stCol(n.status),
+                    rightText = rightTxt,
+                    rightFg = stCol(n.status),
+                }
             end
         end
     end
 
-    -- nodes -------------------------------------------------------------
-    for _, br in ipairs(branches) do
-        writeAt(sx(0), sy(br.headerY), string.upper(br.name), THEME.accent)
-        for _, n in ipairs(br.nodes) do
-            local bx, by = sx(n.x), sy(n.y)
-            local col = stCol(n.status)
-            local label = n.label
-            local maxLen = n.bw - R_PAD * 2
-            if #label > maxLen then label = label:sub(1, maxLen) end
-            -- top border
-            writeAt(bx, by, "┌" .. string.rep("─", n.bw - 2) .. "┐", col)
-            -- name row: solid status-coloured fill, black label
-            fillRow(bx, by + 1, n.bw, col)
-            local lpad = math.floor((n.bw - #label) / 2)
-            writeAt(bx + lpad, by + 1, label, colors.black, col)
-            -- bottom border (a ┬ tee where the connector exits to children)
-            local ci = math.floor(n.bw / 2)
-            local bot
-            if #n.children > 0 then
-                bot = "└" .. string.rep("─", ci - 1) .. "┬" .. string.rep("─", n.bw - 2 - ci) .. "┘"
-            else
-                bot = "└" .. string.rep("─", n.bw - 2) .. "┘"
-            end
-            writeAt(bx, by + 2, bot, col)
+    -- paginate by line count
+    local rowsAvail = H - bodyY - 1
+    local perPage = math.max(1, rowsAvail)
+    local pages = math.max(1, math.ceil(#lines / perPage))
+    app.page[4] = clamp(app.page[4], 1, pages)
+    ui.pages[4] = pages
+
+    -- render + capture branch hit-test rects for touch toggling
+    ui.research = { branches = {} }
+    local start = (app.page[4] - 1) * perPage
+    local row = bodyY
+    for i = start + 1, math.min(#lines, start + perPage) do
+        if row > H - 1 then break end
+        local ln = lines[i]
+        if ln.rightText then
+            -- node line: name left, status right-aligned
+            local rightW = #ln.rightText + 1
+            local maxLeft = innerW - rightW
+            local left = ln.text
+            if maxLeft > 0 and #left > maxLeft then left = left:sub(1, maxLeft) end
+            writeAt(x0, row, left, ln.fg)
+            writeRight(x1, row, ln.rightText, ln.rightFg or ln.fg)
+        else
+            local t = ln.text
+            if #t > innerW then t = t:sub(1, innerW) end
+            writeAt(x0, row, t, ln.fg)
         end
+        if ln.kind == "branch" then
+            ui.research.branches[#ui.research.branches + 1] =
+                { y = row, name = ln.name }
+        end
+        row = row + 1
     end
-
-    -- pan indicators (touch-scroll hints on the edges) -------------------
-    local midX = math.floor((x0 + x1) / 2)
-    if panX > 0 then writeAt(x0, y0 + math.floor(vh / 2), "<", THEME.accent, THEME.bg) end
-    if panX < maxX then writeAt(x1, y0 + math.floor(vh / 2), ">", THEME.accent, THEME.bg) end
-    if panY > 0 then writeAt(midX, y0, "^", THEME.accent, THEME.bg) end
-    if panY < maxY then writeAt(midX, y1, "v", THEME.accent, THEME.bg) end
-
-    ui.research = { canvas = canvas, vw = vw, vh = vh, x0 = x0, y0 = y0, x1 = x1, y1 = y1 }
-    ui.pages[4] = 1
 end
 
 --===========================================================================
@@ -1259,11 +1157,11 @@ local function render()
 
     -- footer controls — fully touch-driven (no keys required)
     local ctrl = { hasPrev = false, hasNext = false }
-    if app.view == 4 and ui.research then
-        local r = ui.research
-        local maxX = math.max(0, r.canvas.w - r.vw)
-        ctrl.hasPrev = app.pan.x > 0
-        ctrl.hasNext = app.pan.x < maxX
+    local pages = ui.pages[app.view] or 1
+    if app.view == 4 then
+        -- research: legend in center, < > page when expanded branches overflow
+        ctrl.hasPrev = app.page[4] > 1
+        ctrl.hasNext = app.page[4] < pages
         ctrl.center = function(y)
             local parts = { { THEME.good, "done" }, { THEME.warn, "wip" }, { THEME.info, "open" } }
             local tw = 0
@@ -1276,7 +1174,6 @@ local function render()
             end
         end
     else
-        local pages = ui.pages[app.view] or 1
         local s
         if pages > 1 then
             ctrl.hasPrev = app.page[app.view] > 1
@@ -1308,28 +1205,8 @@ local function onPage(dir)
     app.page[app.view] = clamp(p, 1, maxP)
 end
 
--- horizontal nav driven by the footer < / > touch buttons:
--- pages for the list views, horizontal pan for the research tree
-local function onLeft()
-    if app.view == 4 and ui.research then
-        local r = ui.research
-        local maxX = math.max(0, r.canvas.w - r.vw)
-        local step = math.max(4, math.floor(r.vw / 4))
-        app.pan.x = clamp(app.pan.x - step, 0, maxX)
-    else
-        onPage(-1)
-    end
-end
-local function onRight()
-    if app.view == 4 and ui.research then
-        local r = ui.research
-        local maxX = math.max(0, r.canvas.w - r.vw)
-        local step = math.max(4, math.floor(r.vw / 4))
-        app.pan.x = clamp(app.pan.x + step, 0, maxX)
-    else
-        onPage(1)
-    end
-end
+local function onLeft() onPage(-1) end
+local function onRight() onPage(1) end
 
 local function handleTouch(side, x, y)
     -- 1. tab bar
@@ -1341,20 +1218,13 @@ local function handleTouch(side, x, y)
         if x <= math.floor(W / 2) then onLeft() else onRight() end
         return
     end
-    -- 3. research tree: tap the body edges to pan (touch-only)
-    if app.view == 4 and ui.body and ui.research then
-        local b, r = ui.body, ui.research
-        if y >= b.y0 and y <= b.y1 and x >= b.x0 and x <= b.x1 then
-            local maxX, maxY = math.max(0, r.canvas.w - r.vw), math.max(0, r.canvas.h - r.vh)
-            local stepX, stepY = math.max(4, math.floor(r.vw / 4)), math.max(3, math.floor(r.vh / 3))
-            if x <= b.x0 + 3 then
-                app.pan.x = clamp(app.pan.x - stepX, 0, maxX)
-            elseif x >= b.x1 - 3 then
-                app.pan.x = clamp(app.pan.x + stepX, 0, maxX)
-            elseif y <= b.y0 + 1 then
-                app.pan.y = clamp(app.pan.y - stepY, 0, maxY)
-            elseif y >= b.y1 - 1 then
-                app.pan.y = clamp(app.pan.y + stepY, 0, maxY)
+    -- 3. research: tap a branch summary line to expand/collapse it
+    if app.view == 4 and ui.research and ui.research.branches then
+        for _, b in ipairs(ui.research.branches) do
+            if y == b.y then
+                app.expanded[b.name] = not app.expanded[b.name]
+                app.page[4] = 1          -- expanding changes line count; reset page
+                return
             end
         end
     end
