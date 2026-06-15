@@ -749,14 +749,14 @@ local function viewBuildings(bodyY)
     local columns = {
         { header = "BUILDING", align = "left",  wrap = true,
           color = function() return THEME.text end },
-        { header = "TYPE",     align = "left",  wrap = false,
-          color = function() return THEME.dim end },
         { header = "COLONIST", align = "left",  wrap = false,
           color = function(_, r) return r._colonistCol end },
         { header = "LEVEL",    align = "right", wrap = false,
           color = function(_, r) return ratioColour(r._ratio) end },
         { header = "STATUS",   align = "right", wrap = false,
           color = function(_, r) return r._stCol end },
+        { header = "GUARDED",  align = "right", wrap = false,
+          color = function(_, r) return r._guardCol end },
     }
     local rows = {}
     for _, b in ipairs(shown) do
@@ -793,13 +793,14 @@ local function viewBuildings(bodyY)
         end
         table.insert(rows, {
             humanize(bname),
-            humanize(b.type),
             colonist,
             string.format("%d/%d", lvl, maxL),
             stTxt,
+            b.guarded and "Yes" or "No",
             _ratio = lvl / maxL,
             _stCol = stCol,
             _colonistCol = colonistCol,
+            _guardCol = b.guarded and THEME.good or THEME.dim,
         })
     end
     drawTable(2, bodyY, tableW, tableH, columns, rows, 2)
