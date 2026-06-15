@@ -175,11 +175,17 @@ local app, ui
 -- diamond_pickaxe). Parse the material from each registry name and return the
 -- min-max level range, or nil if this isn't a tool/armor request.
 --   Wood/Gold=1  Stone=2  Iron=3  Diamond=4  Netherite=5
-local asTable  -- forward declaration (defined later in COLONY DATA LAYER); tierInfo needs it
+local asTable, humanize  -- forward declarations (defined later); tierInfo needs them
 local TOOL_TIERS = {
     wood = 1, wooden = 1, golden = 1, gold = 1,
     stone = 2, iron = 3, chain = 3, chainmail = 3,
     diamond = 4, netherite = 5,
+}
+-- human-readable material name per registry material key (for tier display)
+local MAT_NAMES = {
+    wood = "Wood", wooden = "Wood", golden = "Gold", gold = "Gold",
+    stone = "Stone", iron = "Iron", chain = "Chain", chainmail = "Chain",
+    diamond = "Diamond", netherite = "Netherite",
 }
 local TOOL_TYPES = {
     pickaxe = true, axe = true, shovel = true, hoe = true, sword = true,
@@ -188,7 +194,7 @@ local TOOL_TYPES = {
     shears = true, flint_and_steel = true,
 }
 local function tierInfo(items)
-    local minT, maxT, tname
+    local minT, maxT, minName, maxName, tname
     for _, it in ipairs(asTable(items)) do
         local reg = tostring(it.name or "")
         -- strip namespace:  "minecraft:iron_pickaxe" -> "iron_pickaxe"
@@ -198,13 +204,15 @@ local function tierInfo(items)
             local tier = TOOL_TIERS[mat]
             if tier then
                 tname = tname or kind
-                if minT == nil or tier < minT then minT = tier end
-                if maxT == nil or tier > maxT then maxT = tier end
+                local dname = MAT_NAMES[mat] or humanize(mat)
+                if minT == nil or tier < minT then minT, minName = tier, dname end
+                if maxT == nil or tier > maxT then maxT, maxName = tier, dname end
             end
         end
     end
     if minT == nil then return nil end
-    return { min = minT, max = maxT, kind = tname or "tool" }
+    return { min = minT, max = maxT, minName = minName, maxName = maxName,
+             kind = tname or "tool" }
 end
 
 --===========================================================================
@@ -213,7 +221,7 @@ end
 --   "com.minecolonies.buildings.GuardTower" -> "Guard Tower"
 --   "minecolonies:guard_tower"              -> "Guard Tower"
 -- Already-readable strings (no "." or ":") are returned untouched.
-local function humanize(s)
+function humanize(s)
     if s == nil then return "?" end
     s = tostring(s)
     if s == "" then return "?" end
@@ -666,8 +674,12 @@ local function viewDashboard(bodyY)
     local row = ay
     local function alertLine(state, text)
         if row > ay + ih - 1 then return end
-        led(3, row, nil, state)               -- LED at the card's inner left (x=3)
-        writeAt(5, row, text, THEME.text)
+        local col = state == "bad" and THEME.bad
+                 or state == "warn" and THEME.warn
+                 or THEME.good
+        local barW = leftW - 2
+        fillRow(3, row, barW, col)                  -- full-width coloured bar
+        writeAt(4, row, text, colors.black, col)    -- black text on solid bg
         row = row + 1
     end
     if d.underAttack then
@@ -737,20 +749,33 @@ local function viewDashboard(bodyY)
         writeAt(3, row, "No outstanding requests", THEME.dim)
     else
         local maxRow = ry + rh - 1
-        -- classify a request's state into a tag + colour
-        --   need  = open, still needs a supply source (player or a citizen to claim)
-        --   craft = in progress, a citizen is actively making/delivering it
-        --   done  = completed
+        -- classify a request's state into a tag + colour.
+        -- MineColonies' state enum is undocumented, so we do NOT guess buckets:
+        -- the tag shows the ACTUAL raw state (humanized), coloured by any stem
+        -- we recognise. This means you always see the real status string.
         local function classify(r)
-            local st = string.lower(tostring(r.state or ""))
-            st = st:gsub("[%s_]+", "")           -- normalise: "in progress" -> "inprogress"
-            if st == "completed" or st == "resolved" or st == "done" then
-                return "done", THEME.good
-            elseif st == "inprogress" or st == "claiming" or st == "crafting"
-                or st == "delivering" or st == "beingdelivered" then
-                return "craft", THEME.info
+            local raw = tostring(r.state or "")
+            local low = raw:lower()
+            local stem = low:gsub("[%s_]+", "")        -- "in progress" -> "inprogress"
+            local col
+            if stem == "completed" or stem == "resolved" or stem == "done" then
+                col = THEME.good
+            elseif stem:find("deliver") then
+                col = THEME.accent
+            elseif stem:find("progress") or stem:find("claim") or stem:find("craft") then
+                col = THEME.warn
+            elseif stem == "" or stem == "open" then
+                col = THEME.bad
+            else
+                col = THEME.info                       -- unknown -> visible, not hidden
             end
-            return "need", THEME.warn            -- open / unknown = still needs a source
+            -- humanize the raw state for the tag, e.g. "IN_PROGRESS" -> "In Progress"
+            local tag = humanize(low:gsub("_", " "))
+            tag = tag:gsub("(%a)(%w*)", function(a, rest)  -- Title Case each word
+                return a:upper() .. rest:lower()
+            end)
+            if #tag > 12 then tag = tag:sub(1, 12) end   -- cap so it can't eat the item
+            return tag, col
         end
         for _, src in ipairs(order) do
             -- need room for the source header + at least one item line
@@ -782,9 +807,9 @@ local function viewDashboard(bodyY)
                 if ti then
                     local lv
                     if ti.min == ti.max then
-                        lv = " (Lv " .. ti.min .. ")"
+                        lv = " (" .. ti.minName .. ")"
                     else
-                        lv = " (Lv " .. ti.min .. "-" .. ti.max .. ")"
+                        lv = " (" .. ti.minName .. "-" .. ti.maxName .. ")"
                     end
                     item = item .. lv
                 end
