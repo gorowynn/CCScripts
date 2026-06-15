@@ -627,60 +627,108 @@ end
 local function viewDashboard(bodyY)
     local d = Colony.data
     if not d then return end
+    local flags = Colony.citizenFlags()
 
-    -- top stat cards row --------------------------------------------------
-    local cardGap = 1
-    local n = 4
-    local cw = math.floor((W - (n + 1) * cardGap) / n)
-    local bx = 2
-    local by = bodyY
+    -- ===== LAYOUT: left vital rail  |  right (alerts + requests) =====
+    local railW  = math.max(14, math.floor(W * 0.35))
+    if railW > W - 24 then railW = W - 24 end        -- keep the right side usable
+    local railX  = 2
+    local rightX = railX + railW + 1                  -- 1-col gutter between rail and right
+    local rightW = W - rightX - 1
+    local innerX = rightX + 1                         -- inner content origin for the right column
+    local innerW = rightW - 2
 
-    -- helper to render a stat card
-    local function statCard(x, label, big, sub, accent)
-        card(x, by, cw, 1, 2, label, accent)
-        writeAt(x + 1, by + 1, big, THEME.text)
-        if sub then writeAt(x + 1, by + 2, sub, THEME.dim) end
+    -- job map for resolving request sources to "Name (Job)"
+    local jobByName = {}
+    for _, c in ipairs(asTable(d.citizenList)) do
+        local jn = c.work and c.work.job
+        if c.name and jn then jobByName[tostring(c.name):lower()] = humanize(jn) end
+    end
+    local function resolveSource(raw)
+        local name = tostring(raw or "Unknown")
+        if name == "" then name = "Unknown" end
+        local h = humanize(name)
+        local job = jobByName[name:lower()]
+        if job then return h .. " (" .. job .. ")" end
+        return h
     end
 
-    statCard(bx, "CITIZENS", tostring(d.citizens or 0) .. "/" .. tostring(d.maxCitizens or 0),
-        string.format("%.0f%% capacity", Colony.citizenRatio() * 100), colors.lime)
-    statCard(bx + (cw + cardGap), "HAPPINESS", string.format("%.1f", d.happiness or 0),
-        string.format("%.0f%%", Colony.happinessRatio() * 100), colors.cyan)
-    statCard(bx + (cw + cardGap) * 2, "BUILDINGS", tostring(#d.buildings),
-        "structures", colors.yellow)
-    statCard(bx + (cw + cardGap) * 3, "VISITORS", tostring(#d.visitors),
-        "in tavern", colors.purple)
+    -- ============ LEFT RAIL — stacked vital cards ============
+    local function railNext(y, h, b) return y + h + b + 1 end
 
-    -- thin gauge strip: citizen capacity + happiness ---------------------
-    local gy = by + 3
-    local half = math.floor((W - 2) / 2)
-    writeAt(2, gy, "CAP", THEME.dim)
-    gauge(6, gy, math.max(4, half - 5), Colony.citizenRatio(),
+    -- CITIZENS: count + capacity gauge
+    local ry = bodyY
+    local _, cy1 = card(railX, ry, railW, 1, 2, "CITIZENS", colors.lime,
+        string.format("%.0f%%", Colony.citizenRatio() * 100))
+    writeAt(railX + 1, cy1, tostring(d.citizens or 0) .. " / " .. tostring(d.maxCitizens or 0), THEME.text)
+    gauge(railX + 1, cy1 + 1, railW - 2, Colony.citizenRatio(),
         ratioColour(Colony.citizenRatio()), THEME.faint)
-    local hx = 2 + half + 1
-    writeAt(hx, gy, "MOOD", THEME.dim)
-    gauge(hx + 5, gy, math.max(4, W - (hx + 5) - 1), Colony.happinessRatio(),
+    ry = railNext(ry, 1, 2)
+
+    -- HAPPINESS: value + mood gauge
+    local _, hy1 = card(railX, ry, railW, 1, 2, "HAPPINESS", colors.cyan,
+        string.format("%.1f", d.happiness or 0))
+    gauge(railX + 1, hy1, railW - 2, Colony.happinessRatio(),
         ratioColour(Colony.happinessRatio()), THEME.faint)
+    writeRight(railX + railW - 2, hy1, string.format("%.0f%%", Colony.happinessRatio() * 100), THEME.dim)
+    ry = railNext(ry, 1, 2)
 
-    -- alerts + citizen-status row ----------------------------------------
-    local midY = by + 4
-    local flags = Colony.citizenFlags()
-    local leftW = math.floor(W * 0.4) - 2
-    local rightX = leftW + 4
-    local rightW = W - rightX - 1
+    -- CITIZEN STATUS breakdown
+    local _, sy1 = card(railX, ry, railW, 1, 4, "CITIZEN STATUS", colors.lightBlue)
+    local srow = sy1
+    local function sline(label, val, col)
+        writeAt(railX + 1, srow, label, THEME.dim)
+        writeRight(railX + railW - 2, srow, val, col or THEME.text)
+        srow = srow + 1
+    end
+    sline("Adults",   tostring(flags.adults))
+    sline("Children", tostring(flags.children))
+    sline("Idle",     tostring(flags.idle),   flags.idle > 0 and THEME.warn)
+    sline("Hungry",   tostring(flags.hungry), flags.hungry > 0 and THEME.bad)
+    ry = railNext(ry, 1, 4)
 
-    -- ALERTS card
-    local _, ay, iw, ih = card(2, midY, leftW, 1, 5, "ALERTS", colors.red)
-    local row = ay
+    -- VISITORS: recruitment opportunity
+    if ry < H - 1 then
+        local vList = asTable(d.visitors)
+        local vbodyH = (#vList > 0) and 2 or 1
+        local _, vy1 = card(railX, ry, railW, 1, vbodyH, "VISITORS", colors.purple)
+        if #vList == 0 then
+            writeAt(railX + 1, vy1, "None in tavern", THEME.dim)
+        else
+            writeAt(railX + 1, vy1, #vList .. " available", THEME.text)
+            -- first visitor's recruit cost (compact, up to 2 items)
+            local costTxt = "free"
+            local cost = vList[1].recruitCost
+            if type(cost) == "table" then
+                local parts = {}
+                for i, it in ipairs(cost) do
+                    if i > 2 then break end
+                    parts[#parts + 1] = tostring(it.count or "?") .. " "
+                        .. humanize(it.displayName or it.name or "?")
+                end
+                if #parts > 0 then costTxt = table.concat(parts, ", ") end
+            end
+            local cl = "cost: " .. costTxt
+            if #cl > railW - 2 then cl = cl:sub(1, railW - 2) end
+            writeAt(railX + 1, vy1 + 1, cl, THEME.dim)
+        end
+    end
+
+    -- ============ RIGHT — ALERTS banner ============
+    local alertBodyH = 4
+    local _, alY, _, alH = card(rightX, bodyY, rightW, 1, alertBodyH, "ALERTS", colors.red)
+    local arow = alY
+    local aMax = alY + alH - 1
     local function alertLine(state, text)
-        if row > ay + ih - 1 then return end
+        if arow > aMax then return end
         local col = state == "bad" and THEME.bad
                  or state == "warn" and THEME.warn
                  or THEME.good
-        local barW = leftW - 2
-        fillRow(3, row, barW, col)                  -- full-width coloured bar
-        writeAt(4, row, text, colors.black, col)    -- black text on solid bg
-        row = row + 1
+        fillRow(rightX + 1, arow, rightW - 2, col)            -- full-width coloured bar
+        local t = text
+        if #t > innerW then t = t:sub(1, innerW) end
+        writeAt(innerX, arow, t, colors.black, col)          -- black text on solid bg
+        arow = arow + 1
     end
     if d.underAttack then
         alertLine("bad", "COLONY UNDER ATTACK!")
@@ -699,39 +747,12 @@ local function viewDashboard(bodyY)
         alertLine("bad", "Happiness is critically low")
     end
 
-    -- CITIZEN STATUS card
-    local _, cy, cw2, ch2 = card(rightX, midY, rightW, 1, 5, "CITIZEN STATUS", colors.lightBlue)
-    row = cy
-    local function statusLine(label, val, col)
-        writeAt(rightX + 1, row, label, THEME.dim)
-        writeRight(rightX + rightW - 2, row, val, col or THEME.text)
-        row = row + 1
-    end
-    statusLine("Adults",     tostring(flags.adults))
-    statusLine("Children",   tostring(flags.children))
-    statusLine("Asleep",     tostring(flags.asleep))
-    statusLine("Idle",       tostring(flags.idle), flags.idle > 0 and THEME.warn)
-    statusLine("Need food",  tostring(flags.hungry), flags.hungry > 0 and THEME.bad)
-
-    -- REQUESTS card (fills the bottom) -----------------------------------
-    local reqY = midY + 7
+    -- ============ RIGHT — ACTIVE REQUESTS (fills the rest) ============
+    local reqY = bodyY + 1 + alertBodyH + 1               -- below the alerts card
     local reqH = H - 1 - reqY
     if reqH < 2 then reqH = 2 end
-    -- group requests by source (the `target` field) before drawing the card
-    -- if a source name matches a citizen, append their job: Hammond (Forester)
-    local jobByName = {}
-    for _, c in ipairs(asTable(d.citizenList)) do
-        local jn = c.work and c.work.job
-        if c.name and jn then jobByName[tostring(c.name):lower()] = humanize(jn) end
-    end
-    local function resolveSource(raw)
-        local name = tostring(raw or "Unknown")
-        if name == "" then name = "Unknown" end
-        local h = humanize(name)
-        local job = jobByName[name:lower()]
-        if job then return h .. " (" .. job .. ")" end
-        return h
-    end
+
+    -- group requests by source
     local order, bySrc = {}, {}
     for _, r in ipairs(d.requests) do
         local src = resolveSource(r.target)
@@ -742,13 +763,13 @@ local function viewDashboard(bodyY)
     local reqLabel = #d.requests .. " req"
     if #order > 1 then reqLabel = reqLabel .. "  " .. #order .. " src" end
 
-    local _, ry, rw, rh = card(2, reqY, W - 2, 1, reqH, "ACTIVE REQUESTS", colors.orange,
+    local _, rqY, _, rqH = card(rightX, reqY, rightW, 1, reqH, "ACTIVE REQUESTS", colors.orange,
         reqLabel)
-    row = ry
+    local row = rqY
     if #d.requests == 0 then
-        writeAt(3, row, "No outstanding requests", THEME.dim)
+        writeAt(innerX, row, "No outstanding requests", THEME.dim)
     else
-        local maxRow = ry + rh - 1
+        local maxRow = rqY + rqH - 1
         -- classify a request's state into a tag + colour.
         -- MineColonies' state enum is undocumented, so we do NOT guess buckets:
         -- the tag shows the ACTUAL raw state (humanized), coloured by any stem
@@ -780,12 +801,12 @@ local function viewDashboard(bodyY)
         for _, src in ipairs(order) do
             -- need room for the source header + at least one item line
             if row > maxRow - 1 then
-                if row <= maxRow then writeAt(3, row, "...more", THEME.dim) end
+                if row <= maxRow then writeAt(innerX, row, "...more", THEME.dim) end
                 break
             end
             local hdr = src .. "  (" .. #bySrc[src] .. ")"
-            if #hdr > W - 4 then hdr = hdr:sub(1, W - 4) end
-            writeAt(3, row, hdr, THEME.accent)            -- source group header
+            if #hdr > innerW then hdr = hdr:sub(1, innerW) end
+            writeAt(innerX, row, hdr, THEME.accent)         -- source group header
             row = row + 1
             for _, r in ipairs(bySrc[src]) do
                 if row > maxRow then break end
@@ -815,10 +836,10 @@ local function viewDashboard(bodyY)
                 end
                 -- tag prefix in state colour, item text in default text colour
                 local tagStr = "[" .. tag .. "] "
-                local itemMax = (W - 1) - (5 + #tagStr)
+                local itemMax = innerW - #tagStr
                 if itemMax > 0 and #item > itemMax then item = item:sub(1, itemMax) end
-                writeAt(5, row, tagStr, tagCol)
-                writeAt(5 + #tagStr, row, item, THEME.text)
+                writeAt(innerX, row, tagStr, tagCol)
+                writeAt(innerX + #tagStr, row, item, THEME.text)
                 row = row + 1
             end
         end
