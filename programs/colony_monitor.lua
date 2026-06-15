@@ -668,30 +668,53 @@ local function viewDashboard(bodyY)
     local reqY = midY + 7
     local reqH = H - 1 - reqY
     if reqH < 2 then reqH = 2 end
+    -- group requests by source (the `target` field) before drawing the card
+    local order, bySrc = {}, {}
+    for _, r in ipairs(d.requests) do
+        local src = humanize(tostring(r.target or "Unknown"))
+        if src == "" then src = "Unknown" end
+        if not bySrc[src] then bySrc[src] = {}; order[#order + 1] = src end
+        bySrc[src][#bySrc[src] + 1] = r
+    end
+    local reqLabel = #d.requests .. " req"
+    if #order > 1 then reqLabel = reqLabel .. "  " .. #order .. " src" end
+
     local _, ry, rw, rh = card(2, reqY, W - 2, 1, reqH, "ACTIVE REQUESTS", colors.orange,
-        #d.requests .. " total")
+        reqLabel)
     row = ry
     if #d.requests == 0 then
         writeAt(3, row, "No outstanding requests", THEME.dim)
     else
-        for i = 1, math.min(#d.requests, rh) do
-            local r = d.requests[i]
-            if not r then break end
+        local maxRow = ry + rh - 1
+        local function stateCol(r)
             local st = string.lower(r.state or "")
-            local stateCol = (st == "completed" or st == "resolved") and THEME.good
-                         or (st == "inprogress" or st == "in progress") and THEME.warn
-                         or THEME.info
-            local nm = humanize(tostring(r.name or r.target or "?"))
-            local need = tostring(r.count or "?")
-            if r.minCount and r.minCount ~= r.count then
-                need = need .. "/" .. tostring(r.minCount)
+            if st == "completed" or st == "resolved" then return THEME.good end
+            if st == "inprogress" or st == "in progress" then return THEME.warn end
+            return THEME.info
+        end
+        for _, src in ipairs(order) do
+            -- need room for the source header + at least one item line
+            if row > maxRow - 1 then
+                if row <= maxRow then writeAt(3, row, "...more", THEME.dim) end
+                break
             end
-            -- name fills the space between x=3 and the right-aligned count
-            local nameMax = (W - 1) - 3 - #need - 1
-            if nameMax > 0 and #nm > nameMax then nm = nm:sub(1, nameMax) end
-            writeAt(3, row, nm, THEME.text)
-            writeRight(W - 1, row, need, stateCol)
+            local hdr = src .. "  (" .. #bySrc[src] .. ")"
+            if #hdr > W - 4 then hdr = hdr:sub(1, W - 4) end
+            writeAt(3, row, hdr, THEME.accent)            -- source group header
             row = row + 1
+            for _, r in ipairs(bySrc[src]) do
+                if row > maxRow then break end
+                local nm = humanize(tostring(r.name or "?"))
+                local need = tostring(r.count or "?")
+                if r.minCount and r.minCount ~= r.count then
+                    need = need .. "/" .. tostring(r.minCount)
+                end
+                local nameMax = (W - 1) - 5 - #need - 1
+                if nameMax > 0 and #nm > nameMax then nm = nm:sub(1, nameMax) end
+                writeAt(5, row, nm, THEME.text)             -- indented item
+                writeRight(W - 1, row, need, stateCol(r))
+                row = row + 1
+            end
         end
     end
 end
