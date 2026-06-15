@@ -29,7 +29,8 @@ local CONFIG = {
     monitorSide     = nil,    -- nil = auto-detect the first monitor found
     colonySide      = nil,    -- nil = auto-detect the colony integrator
     textScale       = 0.5,    -- 0.5 = dense (great for a wall of monitors)
-    colonyName      = nil,    -- optional friendly name; defaults to "Colony #ID"
+    colonyName        = nil,    -- optional friendly name; defaults to "Colony #ID"
+    buildingBlacklist = { "stash", "postbox" },  -- hide these from the Buildings view (substring match on name/type)
 }
 
 --===========================================================================
@@ -244,12 +245,17 @@ local function computeWidths(columns, rows, w)
 
     local naturals = {}
     for ci, col in ipairs(columns) do
-        local nw = #col.header
-        for _, row in ipairs(rows) do
-            local c = row[ci] or ""
-            if #c > nw then nw = #c end
+        if col.type == "bar" then
+            -- fixed width: bar cells + 1 gap + 4-char percentage (e.g. "100%")
+            naturals[ci] = math.max(#col.header, (col.barW or 4) + 5)
+        else
+            local nw = #col.header
+            for _, row in ipairs(rows) do
+                local c = row[ci] or ""
+                if #c > nw then nw = #c end
+            end
+            naturals[ci] = nw
         end
-        naturals[ci] = nw
     end
     local totalNat = gutter * (ncol - 1)
     for ci = 1, ncol do totalNat = totalNat + naturals[ci] end
@@ -325,17 +331,28 @@ local function drawTable(x, y, w, bodyH, columns, rows, viewIdx)
         local rh = rowHeight(columns, dataRow, widths, wrapCi)
         for ci = 1, ncol do
             local col = columns[ci]
-            local fg = (col.color and col.color(dataRow[ci], dataRow)) or THEME.text
-            local lines = (ci == wrapCi)
-                and wrapText(dataRow[ci] or "", widths[ci])
-                or  { dataRow[ci] or "" }
-            for li = 1, #lines do
-                local yy = row + li - 1
-                if yy > y + bodyH - 1 then break end
-                if col.align == "right" then
-                    writeRight(cx[ci] + widths[ci] - 1, yy, lines[li], fg)
-                else
-                    writeAt(cx[ci], yy, lines[li], fg)
+            if col.type == "bar" then
+                -- cell holds a 0..1 ratio; draw a coloured gauge + percentage
+                local ratio = clamp(tonumber(dataRow[ci]) or 0, 0, 1)
+                local fg = (col.color and col.color(ratio, dataRow)) or THEME.good
+                local bw = col.barW or 4
+                if row <= y + bodyH - 1 then
+                    gauge(cx[ci], row, bw, ratio, fg, THEME.faint)
+                    writeAt(cx[ci] + bw + 1, row, string.format("%3d%%", math.floor(ratio * 100)), fg)
+                end
+            else
+                local fg = (col.color and col.color(dataRow[ci], dataRow)) or THEME.text
+                local lines = (ci == wrapCi)
+                    and wrapText(dataRow[ci] or "", widths[ci])
+                    or  { dataRow[ci] or "" }
+                for li = 1, #lines do
+                    local yy = row + li - 1
+                    if yy > y + bodyH - 1 then break end
+                    if col.align == "right" then
+                        writeRight(cx[ci] + widths[ci] - 1, yy, lines[li], fg)
+                    else
+                        writeAt(cx[ci], yy, lines[li], fg)
+                    end
                 end
             end
         end
@@ -678,6 +695,23 @@ local function viewBuildings(bodyY)
     local tableW = W - 2
     local tableH = H - bodyY - 1
 
+    -- skip buildings whose name/type contains any blacklisted word
+    local function blacklisted(b)
+        local bl = CONFIG.buildingBlacklist
+        if not bl or #bl == 0 then return false end
+        local hay = (humanize(b.name) .. " " .. humanize(b.type) .. " "
+                     .. tostring(b.name) .. " " .. tostring(b.type)):lower()
+        for _, word in ipairs(bl) do
+            word = tostring(word):lower()
+            if #word > 0 and hay:find(word, 1, true) then return true end
+        end
+        return false
+    end
+    local shown = {}
+    for _, b in ipairs(list) do
+        if not blacklisted(b) then shown[#shown + 1] = b end
+    end
+
     local columns = {
         { header = "BUILDING", align = "left",  wrap = true,
           color = function() return THEME.text end },
@@ -689,7 +723,7 @@ local function viewBuildings(bodyY)
           color = function(_, r) return r._stCol end },
     }
     local rows = {}
-    for _, b in ipairs(list) do
+    for _, b in ipairs(shown) do
         local lvl = tonumber(b.level) or 0
         local maxL = tonumber(b.maxLevel) or 1
         if maxL < 1 then maxL = 1 end
@@ -708,7 +742,7 @@ local function viewBuildings(bodyY)
         })
     end
     drawTable(2, bodyY, tableW, tableH, columns, rows, 2)
-    if #list == 0 then
+    if #shown == 0 then
         writeAt(3, bodyY + 2, "No buildings found", THEME.dim)
     end
 end
@@ -723,33 +757,34 @@ local function viewCitizens(bodyY)
     local tableW = W - 2
     local tableH = H - bodyY - 1
 
+    -- value ceilings used to turn raw stats into 0..1 ratios for the bars
+    local MOOD_MAX, FOOD_MAX = 10, 20
     local columns = {
         { header = "CITIZEN", align = "left",  wrap = true,
           color = function() return THEME.text end },
         { header = "JOB",     align = "left",  wrap = false,
           color = function() return THEME.dim end },
-        { header = "STATE",   align = "left",  wrap = false,
-          color = function(_, r) return r._stCol end },
-        { header = "MOOD",    align = "right", wrap = false,
-          color = function(_, r) return ratioColour((r._mood or 0) / 10) end },
-        { header = "FOOD",    align = "right", wrap = false,
-          color = function(_, r) return r._foodCol end },
+        { header = "HEALTH",  type = "bar", barW = 4,
+          color = function(v) return ratioColour(v) end },
+        { header = "MOOD",    type = "bar", barW = 4,
+          color = function(v) return ratioColour(v) end },
+        { header = "FOOD",    type = "bar", barW = 4,
+          color = function(v) return ratioColour(v) end },
     }
     local rows = {}
     for _, c in ipairs(list) do
         local job = (c.work and c.work.job) or "—"
         local mood = tonumber(c.happiness) or 0
         local food = tonumber(c.saturation) or 0
-        local foodCol = food < 3 and THEME.bad or (food < 6 and THEME.warn or THEME.good)
+        local hp = tonumber(c.health) or 0
+        local hpMax = tonumber(c.maxHealth)
+        if not hpMax or hpMax < 1 then hpMax = 20 end   -- sane default for citizens
         table.insert(rows, {
             c.name or "?",
             humanize(job),
-            humanize(c.state or "—"),
-            string.format("%.1f", mood),
-            string.format("%.1f", food),
-            _stCol = c.isIdle and THEME.warn or THEME.info,
-            _mood = mood,
-            _foodCol = foodCol,
+            clamp(hp / hpMax, 0, 1),
+            clamp(mood / MOOD_MAX, 0, 1),
+            clamp(food / FOOD_MAX, 0, 1),
         })
     end
     drawTable(2, bodyY, tableW, tableH, columns, rows, 3)
