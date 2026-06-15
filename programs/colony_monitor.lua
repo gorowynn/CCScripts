@@ -686,11 +686,20 @@ local function viewDashboard(bodyY)
         writeAt(3, row, "No outstanding requests", THEME.dim)
     else
         local maxRow = ry + rh - 1
-        local function stateCol(r)
-            local st = string.lower(r.state or "")
-            if st == "completed" or st == "resolved" then return THEME.good end
-            if st == "inprogress" or st == "in progress" then return THEME.warn end
-            return THEME.info
+        -- classify a request's state into a tag + colour
+        --   need  = open, still needs a supply source (player or a citizen to claim)
+        --   craft = in progress, a citizen is actively making/delivering it
+        --   done  = completed
+        local function classify(r)
+            local st = string.lower(tostring(r.state or ""))
+            st = st:gsub("[%s_]+", "")           -- normalise: "in progress" -> "inprogress"
+            if st == "completed" or st == "resolved" or st == "done" then
+                return "done", THEME.good
+            elseif st == "inprogress" or st == "claiming" or st == "crafting"
+                or st == "delivering" or st == "beingdelivered" then
+                return "craft", THEME.info
+            end
+            return "need", THEME.warn            -- open / unknown = still needs a source
         end
         for _, src in ipairs(order) do
             -- need room for the source header + at least one item line
@@ -704,6 +713,7 @@ local function viewDashboard(bodyY)
             row = row + 1
             for _, r in ipairs(bySrc[src]) do
                 if row > maxRow then break end
+                local tag, tagCol = classify(r)
                 local nm = humanize(tostring(r.name or "?"))
                 local cnt = tonumber(r.count)
                 local minc = tonumber(r.minCount)
@@ -715,10 +725,13 @@ local function viewDashboard(bodyY)
                 else
                     qty = "?"
                 end
-                local line = qty .. " " .. nm        -- e.g. "1-64 Pumpkin"
-                local max = (W - 1) - 5
-                if max > 0 and #line > max then line = line:sub(1, max) end
-                writeAt(5, row, line, stateCol(r))     -- whole line coloured by state
+                local item = qty .. " " .. nm        -- e.g. "1-64 Pumpkin"
+                -- tag prefix in state colour, item text in default text colour
+                local tagStr = "[" .. tag .. "] "
+                local itemMax = (W - 1) - (5 + #tagStr)
+                if itemMax > 0 and #item > itemMax then item = item:sub(1, itemMax) end
+                writeAt(5, row, tagStr, tagCol)
+                writeAt(5 + #tagStr, row, item, THEME.text)
                 row = row + 1
             end
         end
