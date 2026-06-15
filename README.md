@@ -38,10 +38,12 @@ overview of your MineColonies colony. Polls the **Advanced Peripherals**
   capacity & mood gauges, an alerts panel (under attack, idle/hungry citizens,
   low happiness), citizen-status breakdown, and the colony's active requests.
 - **Buildings** — every structure with type, `Lv x/y` level (colour-coded), and
-  status (OK / BUILDING / RUIN, guarded).
+  status (OK / BUILDING / RUIN, guarded). Dynamic, non-truncating columns.
 - **Citizens** — every citizen with job, state, mood and food saturation.
-- **Research** — the full research tree, grouped by branch, with status LEDs
-  (done / in progress / available) and progress %.
+  Dynamic, non-truncating columns.
+- **Research** — a real **node tree**: each research is a bordered, colour-coded
+  node connected to its parent/children by junction lines, grouped by branch.
+  Larger than the screen? **pan by tapping the edges** (left/right/up/down).
 
 **Requirements:**
 
@@ -65,9 +67,10 @@ overview of your MineColonies colony. Polls the **Advanced Peripherals**
    colony_monitor
    ```
 
-**Controls:** tap the tabs to switch views; tap the bottom corners (or use
-<kbd>←</kbd>/<kbd>→</kbd> and <kbd>1</kbd>–<kbd>4</kbd> on the computer) to
-navigate. Long lists paginate automatically.
+**Controls (fully touch-driven — no keyboard needed):** tap the **tabs** to
+switch views; tap the **`<` / `>`** footer buttons (or the left/right halves of
+the footer) to page lists; on the Research view, tap the **edges** of the screen
+to pan the tree (arrows appear at the edges when there's more to see).
 
 **Tuning:** open the file and edit the `CONFIG` table at the top — refresh
 interval, monitor/colony side overrides, text scale (0.5 = dense, good for a
