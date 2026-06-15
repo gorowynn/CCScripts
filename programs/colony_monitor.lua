@@ -257,18 +257,29 @@ local function computeWidths(columns, rows, w)
             naturals[ci] = nw
         end
     end
+    -- base widths start at the natural (max-content) size
+    local widths = {}
+    for ci = 1, ncol do widths[ci] = naturals[ci] end
+
+    if wrapCi then
+        -- the wrap column absorbs ALL slack (and shrinks on overflow), so the
+        -- table always fills exactly `w` columns.
+        local used = gutter * (ncol - 1)
+        for ci = 1, ncol do
+            if ci ~= wrapCi then used = used + naturals[ci] end
+        end
+        widths[wrapCi] = math.max(6, w - used)
+        return widths, wrapCi
+    end
+
+    -- no wrap column: spread any slack evenly so we still fill the whole width
     local totalNat = gutter * (ncol - 1)
     for ci = 1, ncol do totalNat = totalNat + naturals[ci] end
-
-    if totalNat <= w then return naturals, nil end
-    if not wrapCi then return naturals, nil end           -- can't shrink: keep natural
-
-    local widths, used = {}, gutter * (ncol - 1)
-    for ci = 1, ncol do
-        if ci ~= wrapCi then widths[ci] = naturals[ci]; used = used + naturals[ci] end
-    end
-    widths[wrapCi] = math.max(6, w - used)
-    return widths, wrapCi
+    if totalNat >= w or ncol == 0 then return widths, nil end
+    local slack, per = w - totalNat, math.floor((w - totalNat) / ncol)
+    for ci = 1, ncol do widths[ci] = naturals[ci] + per end
+    widths[ncol] = widths[ncol] + (slack - per * ncol)   -- remainder to last col
+    return widths, nil
 end
 
 -- height (in lines) a single data row will occupy once laid out
@@ -728,10 +739,16 @@ local function viewBuildings(bodyY)
         local maxL = tonumber(b.maxLevel) or 1
         if maxL < 1 then maxL = 1 end
         local stTxt, stCol
-        if b.isWorkingOn then stTxt, stCol = "BUILDING", THEME.warn
-        elseif not b.built then stTxt, stCol = "RUIN", THEME.bad
-        else stTxt, stCol = "OK", THEME.good end
-        if b.guarded then stTxt = stTxt .. " (G)" end
+        if b.isWorkingOn then
+            -- being worked on: first build, or an upgrade on an existing one
+            if b.built then stTxt, stCol = "Upgrading", THEME.warn
+            else stTxt, stCol = "Building", THEME.warn end
+        elseif not b.built then
+            -- not built and not being worked on
+            stTxt, stCol = "Planned", THEME.dim
+        else
+            stTxt, stCol = "OK", THEME.good
+        end
         table.insert(rows, {
             humanize(b.name),
             humanize(b.type),
@@ -773,7 +790,7 @@ local function viewCitizens(bodyY)
     }
     local rows = {}
     for _, c in ipairs(list) do
-        local job = (c.work and c.work.job) or "—"
+        local job = (c.work and c.work.job) or "Unemployed"
         local mood = tonumber(c.happiness) or 0
         local food = tonumber(c.saturation) or 0
         local hp = tonumber(c.health) or 0
