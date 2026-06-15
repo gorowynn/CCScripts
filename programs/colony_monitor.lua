@@ -751,6 +751,8 @@ local function viewBuildings(bodyY)
           color = function() return THEME.text end },
         { header = "TYPE",     align = "left",  wrap = false,
           color = function() return THEME.dim end },
+        { header = "COLONIST", align = "left",  wrap = false,
+          color = function(_, r) return r._colonistCol end },
         { header = "LEVEL",    align = "right", wrap = false,
           color = function(_, r) return ratioColour(r._ratio) end },
         { header = "STATUS",   align = "right", wrap = false,
@@ -772,13 +774,32 @@ local function viewBuildings(bodyY)
         else
             stTxt, stCol = "OK", THEME.good
         end
+        -- building name, falling back to its type when the name is absent
+        local bname = b.name
+        if bname == nil or bname == "" then bname = b.type end
+        -- assigned colonist(s): the API returns a list of {name, id}
+        local cList = asTable(b.citizens)
+        local colonist, colonistCol
+        if #cList == 0 then
+            colonist, colonistCol = "—", THEME.dim
+        else
+            local first = cList[1].name or "?"
+            if #cList == 1 then
+                colonist = tostring(first)
+            else
+                colonist = tostring(first) .. " +" .. (#cList - 1)
+            end
+            colonistCol = THEME.text
+        end
         table.insert(rows, {
-            humanize(b.name),
+            humanize(bname),
             humanize(b.type),
+            colonist,
             string.format("%d/%d", lvl, maxL),
             stTxt,
             _ratio = lvl / maxL,
             _stCol = stCol,
+            _colonistCol = colonistCol,
         })
     end
     drawTable(2, bodyY, tableW, tableH, columns, rows, 2)
