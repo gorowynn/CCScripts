@@ -175,6 +175,7 @@ local app, ui
 -- diamond_pickaxe). Parse the material from each registry name and return the
 -- min-max level range, or nil if this isn't a tool/armor request.
 --   Wood/Gold=1  Stone=2  Iron=3  Diamond=4  Netherite=5
+local asTable  -- forward declaration (defined later in COLONY DATA LAYER); tierInfo needs it
 local TOOL_TIERS = {
     wood = 1, wooden = 1, golden = 1, gold = 1,
     stone = 2, iron = 3, chain = 3, chainmail = 3,
@@ -436,7 +437,7 @@ local function safe(fn, ...)
     return nil
 end
 
-local function asTable(v)  -- never return nil to a range-for
+function asTable(v)  -- never return nil to a range-for
     if type(v) == "table" then return v end
     return {}
 end
