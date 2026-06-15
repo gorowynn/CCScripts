@@ -705,14 +705,20 @@ local function viewDashboard(bodyY)
             for _, r in ipairs(bySrc[src]) do
                 if row > maxRow then break end
                 local nm = humanize(tostring(r.name or "?"))
-                local need = tostring(r.count or "?")
-                if r.minCount and r.minCount ~= r.count then
-                    need = need .. "/" .. tostring(r.minCount)
+                local cnt = tonumber(r.count)
+                local minc = tonumber(r.minCount)
+                local qty
+                if minc and cnt and minc ~= cnt then
+                    qty = minc .. "-" .. cnt          -- range, e.g. 1-64
+                elseif cnt then
+                    qty = tostring(cnt)
+                else
+                    qty = "?"
                 end
-                local nameMax = (W - 1) - 5 - #need - 1
-                if nameMax > 0 and #nm > nameMax then nm = nm:sub(1, nameMax) end
-                writeAt(5, row, nm, THEME.text)             -- indented item
-                writeRight(W - 1, row, need, stateCol(r))
+                local line = qty .. " " .. nm        -- e.g. "1-64 Pumpkin"
+                local max = (W - 1) - 5
+                if max > 0 and #line > max then line = line:sub(1, max) end
+                writeAt(5, row, line, stateCol(r))     -- whole line coloured by state
                 row = row + 1
             end
         end
@@ -781,7 +787,7 @@ local function viewBuildings(bodyY)
         local cList = asTable(b.citizens)
         local colonist, colonistCol
         if #cList == 0 then
-            colonist, colonistCol = "—", THEME.dim
+            colonist, colonistCol = "", THEME.dim
         else
             local first = cList[1].name or "?"
             if #cList == 1 then
@@ -796,7 +802,7 @@ local function viewBuildings(bodyY)
             colonist,
             string.format("%d/%d", lvl, maxL),
             stTxt,
-            b.guarded and "Yes" or "No",
+            b.guarded and "Yes" or "",
             _ratio = lvl / maxL,
             _stCol = stCol,
             _colonistCol = colonistCol,
