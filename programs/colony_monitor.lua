@@ -653,62 +653,89 @@ local function viewDashboard(bodyY)
         return h
     end
 
-    -- ============ LEFT RAIL — stacked vital cards ============
+    -- ============ LEFT RAIL — dense, muted village stats ============
+    local RH = colors.gray          -- muted header colour for the whole rail (no rainbow)
     local function railNext(y, h, b) return y + h + b + 1 end
 
-    -- CITIZENS: count + capacity gauge
-    local ry = bodyY
-    local _, cy1 = card(railX, ry, railW, 1, 2, "CITIZENS", colors.lime,
-        string.format("%.0f%%", Colony.citizenRatio() * 100))
-    writeAt(railX + 1, cy1, tostring(d.citizens or 0) .. " / " .. tostring(d.maxCitizens or 0), THEME.text)
-    gauge(railX + 1, cy1 + 1, railW - 2, Colony.citizenRatio(),
-        ratioColour(Colony.citizenRatio()), THEME.faint)
-    ry = railNext(ry, 1, 2)
-
-    -- HAPPINESS: value + mood gauge
-    local _, hy1 = card(railX, ry, railW, 1, 2, "HAPPINESS", colors.cyan,
-        string.format("%.1f", d.happiness or 0))
-    gauge(railX + 1, hy1, railW - 2, Colony.happinessRatio(),
-        ratioColour(Colony.happinessRatio()), THEME.faint)
-    writeRight(railX + railW - 2, hy1, string.format("%.0f%%", Colony.happinessRatio() * 100), THEME.dim)
-    ry = railNext(ry, 1, 2)
-
-    -- CITIZEN STATUS breakdown
-    local _, sy1 = card(railX, ry, railW, 1, 4, "CITIZEN STATUS", colors.lightBlue)
-    local srow = sy1
-    local function sline(label, val, col)
-        writeAt(railX + 1, srow, label, THEME.dim)
-        writeRight(railX + railW - 2, srow, val, col or THEME.text)
-        srow = srow + 1
+    -- building-derived stats (built / under construction)
+    local bWorking = 0
+    for _, b in ipairs(asTable(d.buildings)) do
+        if b.isWorkingOn then bWorking = bWorking + 1 end
     end
-    sline("Adults",   tostring(flags.adults))
-    sline("Children", tostring(flags.children))
-    sline("Idle",     tostring(flags.idle),   flags.idle > 0 and THEME.warn)
-    sline("Hungry",   tostring(flags.hungry), flags.hungry > 0 and THEME.bad)
+
+    local ry = bodyY
+
+    -- OVERVIEW: all key counts, dense label:value rows
+    local _, oy1 = card(railX, ry, railW, 1, 5, "OVERVIEW", RH)
+    local orow = oy1
+    local function oline(label, val, col)
+        writeAt(railX + 1, orow, label, THEME.dim)
+        writeRight(railX + railW - 2, orow, val, col or THEME.text)
+        orow = orow + 1
+    end
+    oline("Citizens",  tostring(d.citizens or 0) .. "/" .. tostring(d.maxCitizens or 0))
+    oline("Happiness", string.format("%.1f", d.happiness or 0))
+    oline("Buildings", tostring(#d.buildings))
+    oline("Construct", tostring(bWorking), bWorking > 0 and THEME.warn)
+    oline("Requests",  tostring(#d.requests))
+    ry = railNext(ry, 1, 5)
+
+    -- GAUGES: capacity + mood (the only colour in the rail — it encodes ratio)
+    local _, gy1 = card(railX, ry, railW, 1, 2, "GAUGES", RH)
+    writeAt(railX + 1, gy1,     "CAP",  THEME.dim)
+    gauge(railX + 6, gy1, railW - 7, Colony.citizenRatio(),
+        ratioColour(Colony.citizenRatio()), THEME.faint)
+    writeAt(railX + 1, gy1 + 1, "MOOD", THEME.dim)
+    gauge(railX + 6, gy1 + 1, railW - 7, Colony.happinessRatio(),
+        ratioColour(Colony.happinessRatio()), THEME.faint)
+    ry = railNext(ry, 1, 2)
+
+    -- WORKFORCE: citizen breakdown (idle/hungry warn when nonzero)
+    local _, wy1 = card(railX, ry, railW, 1, 4, "WORKFORCE", RH)
+    local wrow = wy1
+    local function wline(label, val, col)
+        writeAt(railX + 1, wrow, label, THEME.dim)
+        writeRight(railX + railW - 2, wrow, val, col or THEME.text)
+        wrow = wrow + 1
+    end
+    wline("Adults",   tostring(flags.adults))
+    wline("Children", tostring(flags.children))
+    wline("Idle",     tostring(flags.idle),   flags.idle > 0 and THEME.warn)
+    wline("Hungry",   tostring(flags.hungry), flags.hungry > 0 and THEME.bad)
     ry = railNext(ry, 1, 4)
 
-    -- VISITORS: recruitment opportunity
+    -- VISITORS: recruitment opportunity + recruit cost
     if ry < H - 1 then
         local vList = asTable(d.visitors)
         local vbodyH = (#vList > 0) and 2 or 1
-        local _, vy1 = card(railX, ry, railW, 1, vbodyH, "VISITORS", colors.purple)
+        local _, vy1 = card(railX, ry, railW, 1, vbodyH, "VISITORS", RH)
         if #vList == 0 then
-            writeAt(railX + 1, vy1, "None in tavern", THEME.dim)
+            writeAt(railX + 1, vy1, "none in tavern", THEME.dim)
         else
             writeAt(railX + 1, vy1, #vList .. " available", THEME.text)
-            -- first visitor's recruit cost (compact, up to 2 items)
-            local costTxt = "free"
+            -- robust recruit-cost parsing: the field may be a single item,
+            -- a list, or a keyed table. Handle all three; never claim "free".
             local cost = vList[1].recruitCost
-            if type(cost) == "table" then
-                local parts = {}
-                for i, it in ipairs(cost) do
-                    if i > 2 then break end
-                    parts[#parts + 1] = tostring(it.count or "?") .. " "
-                        .. humanize(it.displayName or it.name or "?")
-                end
-                if #parts > 0 then costTxt = table.concat(parts, ", ") end
+            local function itemStr(it)
+                if type(it) ~= "table" then return nil end
+                local n = it.displayName or it.name
+                if not n then return nil end
+                local cnt = it.count
+                if cnt then return tostring(cnt) .. " " .. humanize(n) end
+                return humanize(n)
             end
-            local cl = "cost: " .. costTxt
+            local costTxt
+            if type(cost) == "table" then
+                if cost.name or cost.displayName then
+                    costTxt = itemStr(cost)                       -- single item
+                else
+                    for _, it in ipairs(cost) do costTxt = costTxt or itemStr(it) end  -- list
+                    if not costTxt then                          -- keyed table?
+                        for _, it in pairs(cost) do costTxt = costTxt or itemStr(it) end
+                    end
+                end
+            end
+            local cl = costTxt or "no cost data"
             if #cl > railW - 2 then cl = cl:sub(1, railW - 2) end
             writeAt(railX + 1, vy1 + 1, cl, THEME.dim)
         end
