@@ -21,6 +21,8 @@ local term, colors, keys, peripheral, os, string, math, table, pairs, ipairs, to
     = term, colors, keys, peripheral, os, string, math, table, pairs, ipairs, tostring, tonumber, type, error
 local unpack = unpack or table.unpack   -- Lua 5.1 has global unpack; be safe
 
+local CLI = { ... }   -- program args; "test" runs the self-check instead of main
+
 --===========================================================================
 -- CONFIG  ·  tweak to taste
 --===========================================================================
@@ -31,6 +33,21 @@ local CONFIG = {
     textScale       = 0.5,    -- 0.5 = dense (great for a wall of monitors)
     colonyName        = nil,    -- optional friendly name; defaults to "Colony #ID"
     buildingBlacklist = { "stash", "postbox" },  -- hide these from the Buildings view (substring match on name/type)
+    -- control-room extras -------------------------------------------------
+    stuckPolls     = 12,    -- refreshes a request stays unresolved before flagged STUCK (x refreshInterval s)
+    historyMax     = 60,    -- how many refresh samples the trend sparklines keep
+    -- building types (substring, case-insensitive) that employ citizens.
+    -- Used by the Action Board / Workforce view to spot empty worker buildings.
+    -- ponytail: maintained by hand; unknown worker types just won't be flagged.
+    workerBuildings = {
+        "builder", "lumberjack", "miner", "farmer", "fisher", "fisherman",
+        "baker", "cook", "smelter", "blacksmith", "crusher", "sawmill",
+        "carpenter", "stonemason", "stonysmeltery", "mechanic", "glassblower",
+        "dyer", "plantation", "warehouse", "deliveryman", "courier",
+        "guard", "barracks", "library", "university", "hospital", "mystic",
+        "enchanter", "archery", "combatacademy", "sifter", "florist", "gardener",
+        "composter", "graveyard", "cowboy", "swineherder", "shepherd",
+    },
 }
 
 --===========================================================================
@@ -47,8 +64,8 @@ local THEME = {
     bad        = colors.red,
     info       = colors.cyan,
     accent     = colors.lightBlue,
-    -- per-view accent used for the title bar + tab highlight
-    viewAccent = { colors.cyan, colors.yellow, colors.lime, colors.purple },
+    -- per-view accent used for the title bar + tab highlight (one per view)
+    viewAccent = { colors.red, colors.cyan, colors.yellow, colors.lime, colors.purple, colors.blue },
 }
 
 -- colour constant -> single hex char used by term.blit
@@ -115,6 +132,41 @@ end
 -- right-align text ending at column xRight
 local function writeRight(xRight, y, text, fg, bg)
     writeAt(xRight - #text + 1, y, text, fg, bg)
+end
+
+-- pure sparkline builder: returns an ASCII string (<= w chars) whose shading
+-- tracks the value series. ASCII-only so it renders on any CC:T font.
+-- ponytail: auto-ranges to the visible window, so a flat line still prints full width.
+local SPARK = { ' ', '.', ':', '-', '=', '#' }   -- 6 levels, low -> high
+local function sparkString(w, values)
+    if w <= 0 then return "" end
+    local n = #values
+    if n == 0 then return string.rep(' ', w) end
+    local mn, mx = math.huge, -math.huge
+    for _, v in ipairs(values) do
+        v = tonumber(v) or 0
+        if v < mn then mn = v end
+        if v > mx then mx = v end
+    end
+    if mx <= mn then                                       -- flat series: visible steady line, not blank
+        return string.rep(SPARK[math.floor(#SPARK / 2) + 1], w)
+    end
+    local start = (n > w) and (n - w + 1) or 1      -- show the most recent w samples
+    local cols  = n - start + 1
+    local out = string.rep(' ', w - cols)           -- left-pad so newest sits at the right
+    for i = 1, cols do
+        local v = tonumber(values[start + i - 1]) or 0
+        local idx = math.floor(((v - mn) / (mx - mn)) * (#SPARK - 1) + 0.5) + 1
+        idx = clamp(idx, 1, #SPARK)
+        out = out .. SPARK[idx]
+    end
+    assert(#out == w, "sparkline width drift")    -- ponytail: shape invariant
+    return out
+end
+
+-- sparkline renderer wrapper
+local function sparkline(x, y, w, values, fg)
+    writeAt(x, y, sparkString(w, values), fg)
 end
 
 -- horizontal gauge bar; ratio clamped 0..1
@@ -484,6 +536,7 @@ function Colony.refresh()
     end
     Colony.data, Colony.ok, Colony.err = d, true, ""
     Colony.lastPoll = os.clock()
+    Colony.buildJobMap()   -- refresh the name->job map used by resolveSource()
 end
 
 -- derived helpers ---------------------------------------------------------
@@ -510,6 +563,27 @@ function Colony.citizenFlags()
     end
     return { idle = idle, hungry = hungry, asleep = asleep,
              children = children, adults = adults }
+end
+
+-- build a name(lower) -> humanized-job map from the current citizen list.
+-- Powers resolveSource() for request attribution (dashboard + stuck tracker).
+function Colony.buildJobMap()
+    local m = {}
+    for _, c in ipairs(asTable(Colony.data and Colony.data.citizenList)) do
+        local jn = c.work and c.work.job
+        if c.name and jn then m[tostring(c.name):lower()] = humanize(jn) end
+    end
+    Colony._jobMap = m
+end
+
+-- humanize a request target, appending its job when the target is a citizen.
+function Colony.resolveSource(raw)
+    local name = tostring(raw or "Unknown")
+    if name == "" then name = "Unknown" end
+    local h = humanize(name)
+    local job = Colony._jobMap and Colony._jobMap[name:lower()]
+    if job then return h .. " (" .. job .. ")" end
+    return h
 end
 
 --===========================================================================
@@ -569,15 +643,89 @@ local function buildBranches(research)
 end
 
 --===========================================================================
+-- TREND HISTORY  ·  rolling buffer powering the dashboard sparklines
+--===========================================================================
+local History = { samples = {}, max = CONFIG.historyMax }
+
+function History.push(d)
+    if not d then return end
+    local flags = Colony.citizenFlags()
+    local popRatio = (d.maxCitizens and d.maxCitizens > 0)
+        and (d.citizens or 0) / d.maxCitizens or 0
+    local s = History.samples
+    s[#s + 1] = {
+        happiness = tonumber(d.happiness) or 0,
+        requests  = #asTable(d.requests),
+        popRatio  = popRatio,
+        idle      = flags.idle,
+        hungry    = flags.hungry,
+    }
+    while #s > History.max do table.remove(s, 1) end
+end
+
+-- return a plain numeric series for one metric ("happiness"/"requests"/"popRatio")
+function History.series(name)
+    local out = {}
+    for _, e in ipairs(History.samples) do out[#out + 1] = e[name] or 0 end
+    return out
+end
+
+--===========================================================================
+-- STUCK-REQUEST TRACKER  ·  flags requests that never resolve
+-- Keys each non-complete request by (source|item|state) and ages it across
+-- polls; anything present for >= CONFIG.stuckPolls refreshes is "stuck".
+-- ponytail: poll-counter based (deterministic), not wall-clock.
+--===========================================================================
+local Stuck = { sigs = {}, poll = 0 }
+
+function Stuck.refresh(requests)
+    Stuck.poll = Stuck.poll + 1
+    local seen = {}
+    for _, r in ipairs(asTable(requests)) do
+        local raw  = tostring(r.state or "")
+        local stem = raw:lower():gsub("[%s_]+", "")
+        -- only track live (non-complete) requests
+        if stem ~= "completed" and stem ~= "resolved" and stem ~= "done" then
+            local src  = Colony.resolveSource(r.target)
+            local item = humanize(tostring(r.name or "?"))
+            local sig  = src .. "\31" .. tostring(r.name) .. "\31" .. raw
+            seen[sig] = true
+            if not Stuck.sigs[sig] then
+                Stuck.sigs[sig] = { first = Stuck.poll, src = src, item = item }
+            end
+        end
+    end
+    for sig in pairs(Stuck.sigs) do
+        if not seen[sig] then Stuck.sigs[sig] = nil end
+    end
+end
+
+-- list of { age=refreshes, src=, item= } aged past the threshold, oldest first
+function Stuck.staleList()
+    local out, thr = {}, CONFIG.stuckPolls or 12
+    for _, info in pairs(Stuck.sigs) do
+        local seen = Stuck.poll - info.first + 1       -- consecutive refreshes present
+        assert(seen >= 1, "stuck seen nonpositive")      -- ponytail: invariant
+        if seen >= thr then out[#out + 1] = { age = seen, src = info.src, item = info.item } end
+    end
+    table.sort(out, function(a, b) return a.age > b.age end)
+    return out
+end
+
+--===========================================================================
 -- APP STATE  ·  view selection + per-view pagination
 --===========================================================================
 local VIEWS = {
+    { key = "action",    name = "ACTION"    },
     { key = "dashboard", name = "DASHBOARD" },
     { key = "buildings", name = "BUILDINGS" },
     { key = "citizens",  name = "CITIZENS"  },
+    { key = "workforce", name = "WORKFORCE" },
     { key = "research",  name = "RESEARCH"  },
 }
-app = { view = 1, page = { 1, 1, 1, 1 }, expanded = {} }  -- view, per-view page, expanded research branches
+-- named view indices — no magic numbers in dispatch / input handling
+local VI = { ACTION = 1, DASH = 2, BUILD = 3, CITZ = 4, WORK = 5, RESEARCH = 6 }
+app = { view = 1, page = { 1, 1, 1, 1, 1, 1 }, expanded = {} }  -- view, per-view page, expanded research branches
 
 -- hit-test rectangles captured during the last render, for touch handling
 ui = { tabs = {}, prev = nil, next = nil, pages = {}, body = nil, research = nil, footer = nil }
@@ -654,20 +802,8 @@ local function viewDashboard(bodyY)
     local innerX = rightX + 1                         -- inner content origin for the right column
     local innerW = rightW - 2
 
-    -- job map for resolving request sources to "Name (Job)"
-    local jobByName = {}
-    for _, c in ipairs(asTable(d.citizenList)) do
-        local jn = c.work and c.work.job
-        if c.name and jn then jobByName[tostring(c.name):lower()] = humanize(jn) end
-    end
-    local function resolveSource(raw)
-        local name = tostring(raw or "Unknown")
-        if name == "" then name = "Unknown" end
-        local h = humanize(name)
-        local job = jobByName[name:lower()]
-        if job then return h .. " (" .. job .. ")" end
-        return h
-    end
+    -- request source -> "Name (Job)" via the shared colony job map
+    local resolveSource = Colony.resolveSource
 
     -- ============ LEFT RAIL — dense, muted village stats ============
     local RH = colors.gray          -- muted header colour for the whole rail (no rainbow)
@@ -719,6 +855,26 @@ local function viewDashboard(bodyY)
     wline("Idle",     tostring(flags.idle),   flags.idle > 0 and THEME.warn)
     wline("Hungry",   tostring(flags.hungry), flags.hungry > 0 and THEME.bad)
     ry = railNext(ry, 1, 4)
+
+    -- TRENDS: sparkline strip of recent history (happiness / requests / pop)
+    if ry < H - 3 then
+        local _, ty1 = card(railX, ry, railW, 1, 3, "TRENDS", RH)
+        local spX = railX + 6
+        local spW = railW - 12          -- leave room for label + trailing value
+        if spW < 4 then spW = 4 end
+        local function trendRow(yy, label, series, curTxt, col)
+            writeAt(railX + 1, yy, label, THEME.dim)
+            sparkline(spX, yy, spW, series, col)
+            writeRight(railX + railW - 2, yy, curTxt, THEME.text)
+        end
+        trendRow(ty1,     "MOOD", History.series("happiness"),
+            string.format("%.1f", d.happiness or 0), ratioColour(Colony.happinessRatio()))
+        trendRow(ty1 + 1, "REQ",  History.series("requests"),
+            tostring(#(d.requests or {})), THEME.warn)
+        trendRow(ty1 + 2, "POP",  History.series("popRatio"),
+            tostring(d.citizens or 0), THEME.accent)
+        ry = railNext(ry, 1, 3)
+    end
 
     -- VISITORS: recruitment opportunity + recruit cost
     if ry < H - 1 then
@@ -1044,7 +1200,7 @@ local function viewResearch(bodyY)
     local branches = buildBranches(d.research)
     if #branches == 0 then
         writeAt(3, bodyY, "No research data available", THEME.dim)
-        ui.pages[4] = 1
+        ui.pages[VI.RESEARCH] = 1
         return
     end
 
@@ -1092,12 +1248,12 @@ local function viewResearch(bodyY)
     local rowsAvail = H - bodyY - 1
     local perPage = math.max(1, rowsAvail)
     local pages = math.max(1, math.ceil(#lines / perPage))
-    app.page[4] = clamp(app.page[4], 1, pages)
-    ui.pages[4] = pages
+    app.page[VI.RESEARCH] = clamp(app.page[VI.RESEARCH], 1, pages)
+    ui.pages[VI.RESEARCH] = pages
 
     -- render + capture branch hit-test rects for touch toggling
     ui.research = { branches = {} }
-    local start = (app.page[4] - 1) * perPage
+    local start = (app.page[VI.RESEARCH] - 1) * perPage
     local row = bodyY
     for i = start + 1, math.min(#lines, start + perPage) do
         if row > H - 1 then break end
@@ -1119,6 +1275,204 @@ local function viewResearch(bodyY)
             ui.research.branches[#ui.research.branches + 1] =
                 { y = row, name = ln.name }
         end
+        row = row + 1
+    end
+end
+
+--===========================================================================
+-- VIEW 0  ·  ACTION BOARD  (derived, prioritized to-do list)
+-- The headline control-room feature: turns raw colony state into a ranked set
+-- of concrete things to go fix in-game. sev: 1 bad / 2 warn / 3 info.
+--===========================================================================
+local function isWorkerBuilding(b)
+    local hay = (tostring(b.type) .. " " .. tostring(b.name)):lower()
+    for _, w in ipairs(CONFIG.workerBuildings or {}) do
+        w = tostring(w):lower()
+        if #w > 0 and hay:find(w, 1, true) then return true end
+    end
+    return false
+end
+
+local function viewAction(bodyY)
+    local d = Colony.data
+    if not d then return end
+    local flags = Colony.citizenFlags()
+    local items = {}   -- { sev=, text= }
+
+    if d.underAttack then
+        items[#items + 1] = { sev = 1, text = "UNDER ATTACK - raise guards / rally defenders" }
+    end
+    if flags.hungry > 0 then
+        items[#items + 1] = { sev = 1,
+            text = "FOOD: " .. flags.hungry .. " citizens need better food (add variety / restaurant)" }
+    end
+    if Colony.happinessRatio() < 0.5 then
+        items[#items + 1] = { sev = 1,
+            text = "HAPPINESS LOW (" .. string.format("%.1f", d.happiness or 0) .. ") - check food / housing / safety" }
+    end
+    -- stuck requests: the #1 real colony problem (unfulfillable request chain)
+    for _, s in ipairs(Stuck.staleList()) do
+        local total = s.age * CONFIG.refreshInterval
+        local mins = math.floor(total / 60)
+        local secs = total % 60
+        local ageTxt = (mins > 0 and (mins .. "m ") or "") .. secs .. "s"
+        items[#items + 1] = { sev = 2,
+            text = "STUCK: " .. s.item .. " for " .. s.src .. " (" .. ageTxt .. ") - missing chain / material?" }
+    end
+    -- housing near capacity
+    if (d.maxCitizens or 0) > 0 and Colony.citizenRatio() >= 0.9 then
+        items[#items + 1] = { sev = 2,
+            text = "HOUSING: colony " .. (d.citizens or 0) .. "/" .. (d.maxCitizens or 0) .. " nearly full - build / upgrade housing" }
+    end
+    -- built worker buildings with nobody assigned
+    local unstaffed = {}
+    for _, b in ipairs(asTable(d.buildings)) do
+        if b.built and not b.isWorkingOn and isWorkerBuilding(b) and #asTable(b.citizens) == 0 then
+            unstaffed[#unstaffed + 1] = humanize(b.name or b.type)
+        end
+    end
+    for i = 1, math.min(5, #unstaffed) do
+        items[#items + 1] = { sev = 2, text = "STAFF: " .. unstaffed[i] .. " has no worker - assign a citizen" }
+    end
+    if #unstaffed > 5 then
+        items[#items + 1] = { sev = 2, text = "STAFF: " .. (#unstaffed - 5) .. " more unstaffed (see WORKFORCE)" }
+    end
+    if flags.idle > 0 then
+        items[#items + 1] = { sev = 2, text = "IDLE: " .. flags.idle .. " citizens with no job - assign work" }
+    end
+    -- unguarded buildings
+    local unguarded = 0
+    for _, b in ipairs(asTable(d.buildings)) do
+        if b.built and b.guarded == false then unguarded = unguarded + 1 end
+    end
+    if unguarded > 0 then
+        items[#items + 1] = { sev = 3, text = "DEFENSE: " .. unguarded .. " buildings unguarded" }
+    end
+    -- recruitment opportunity
+    local vList = asTable(d.visitors)
+    if #vList > 0 then
+        items[#items + 1] = { sev = 3, text = "RECRUIT: " .. #vList .. " visitor(s) available at the tavern" }
+    end
+    -- research nearest completion
+    local bestProg, bestName = 0, nil
+    for _, br in ipairs(buildBranches(d.research)) do
+        for _, n in ipairs(br.nodes) do
+            if n.status == "prog" and n.progress > bestProg then bestProg, bestName = n.progress, n.label end
+        end
+    end
+    if bestName then
+        items[#items + 1] = { sev = 3,
+            text = "RESEARCH: " .. bestName .. " almost done (" .. math.floor(bestProg * 100) .. "%)" }
+    end
+    if #items == 0 then
+        items[#items + 1] = { sev = 3, text = "All systems nominal - nothing needs attention" }
+    end
+
+    table.sort(items, function(a, b) return a.sev < b.sev end)
+
+    local sevCol = { [1] = THEME.bad, [2] = THEME.warn, [3] = THEME.info }
+    local sevTag = { [1] = "!!", [2] = "!", [3] = " " }
+    local nBad, nWarn, nInfo = 0, 0, 0
+    for _, it in ipairs(items) do
+        if it.sev == 1 then nBad = nBad + 1
+        elseif it.sev == 2 then nWarn = nWarn + 1
+        else nInfo = nInfo + 1 end
+    end
+
+    -- summary strip
+    local sum = string.format("  URGENT %d   WARN %d   INFO %d  ", nBad, nWarn, nInfo)
+    local sumCol = (nBad > 0 and THEME.bad) or (nWarn > 0 and THEME.warn) or THEME.good
+    fillRow(2, bodyY, W - 2, THEME.faint)
+    writeAt(3, bodyY, sum, sumCol, THEME.faint)
+
+    local columns = {
+        { header = "!",     align = "right", color = function(_, r) return sevCol[r._sev] end },
+        { header = "ACTION", wrap = true,    color = function(_, r) return sevCol[r._sev] end },
+    }
+    local rows = {}
+    for _, it in ipairs(items) do
+        rows[#rows + 1] = { sevTag[it._sev] or " ", it.text, _sev = it.sev }
+    end
+    drawTable(2, bodyY + 2, W - 2, H - bodyY - 3, columns, rows, VI.ACTION)
+end
+
+--===========================================================================
+-- VIEW 5  ·  WORKFORCE  (labor distribution + unstaffed buildings)
+--===========================================================================
+local function viewWorkforce(bodyY)
+    local d = Colony.data
+    if not d then return end
+    local tableW = W - 2
+    local tableH = H - bodyY - 1
+
+    -- labor by job
+    local jobCount, order, employed = {}, {}, 0
+    for _, c in ipairs(asTable(d.citizenList)) do
+        local j = (c.work and c.work.job) or nil
+        local label = j and humanize(j) or "Unemployed"
+        jobCount[label] = (jobCount[label] or 0) + 1
+        if j then employed = employed + 1 end
+    end
+    for k in pairs(jobCount) do order[#order + 1] = k end
+    table.sort(order, function(a, b)
+        return jobCount[a] ~= jobCount[b] and jobCount[a] > jobCount[b] or a < b
+    end)
+
+    -- worker-building slots + unstaffed list
+    local slots, unstaffed = 0, {}
+    for _, b in ipairs(asTable(d.buildings)) do
+        if b.built and isWorkerBuilding(b) then
+            slots = slots + 1
+            if #asTable(b.citizens) == 0 then
+                unstaffed[#unstaffed + 1] = humanize(b.name or b.type)
+            end
+        end
+    end
+    local fill = (slots > 0) and (employed / slots) or 0
+
+    -- summary strip
+    fillRow(2, bodyY, tableW, THEME.faint)
+    local sum = string.format("  WORKERS %d   SLOTS %d   FILL %d%%",
+        employed, slots, math.floor(fill * 100))
+    writeAt(3, bodyY, sum, ratioColour(fill), THEME.faint)
+
+    -- top half: labor matrix (paginated)
+    local topH = math.max(4, math.floor(tableH * 0.55) - 1)
+    local laborCols = {
+        { header = "JOB",   align = "left",  wrap = true,
+          color = function(_, r) return r._sev end },
+        { header = "N",     align = "right",
+          color = function() return THEME.text end },
+        { header = "SHARE", type = "bar", barW = 5,
+          color = function(v) return ratioColour(v) end },
+    }
+    local laborRows = {}
+    for _, j in ipairs(order) do
+        local n = jobCount[j]
+        laborRows[#laborRows + 1] = {
+            j, tostring(n), clamp(n / math.max(1, employed), 0, 1),
+            _sev = (j == "Unemployed" and n > 0) and THEME.warn or THEME.text,
+        }
+    end
+    drawTable(2, bodyY + 2, tableW, topH, laborCols, laborRows, VI.WORK)
+
+    -- bottom: unstaffed buildings (manual, capped, no pagination)
+    local uY = bodyY + 2 + topH
+    if uY >= H - 1 then return end
+    writeAt(3, uY, "UNSTAFFED BUILDINGS", THEME.dim)
+    fillRow(2, uY + 1, tableW, THEME.faint)
+    if #unstaffed == 0 then
+        writeAt(3, uY + 2, "none - all worker buildings staffed", THEME.good)
+        return
+    end
+    local row = uY + 2
+    local maxRow = H - 1
+    for i, nm in ipairs(unstaffed) do
+        if row > maxRow then
+            writeRight(W - 2, maxRow, "+" .. (#unstaffed - i + 1) .. " more", THEME.dim)
+            break
+        end
+        writeAt(3, row, "! " .. nm, THEME.warn)
         row = row + 1
     end
 end
@@ -1150,18 +1504,20 @@ local function render()
     -- record body region for touch panning
     ui.body = { x0 = 2, y0 = bodyY, x1 = W - 1, y1 = H - 1 }
 
-    if app.view == 1 then viewDashboard(bodyY)
-    elseif app.view == 2 then viewBuildings(bodyY)
-    elseif app.view == 3 then viewCitizens(bodyY)
-    elseif app.view == 4 then viewResearch(bodyY) end
+    if app.view == VI.ACTION then viewAction(bodyY)
+    elseif app.view == VI.DASH then viewDashboard(bodyY)
+    elseif app.view == VI.BUILD then viewBuildings(bodyY)
+    elseif app.view == VI.CITZ then viewCitizens(bodyY)
+    elseif app.view == VI.WORK then viewWorkforce(bodyY)
+    elseif app.view == VI.RESEARCH then viewResearch(bodyY) end
 
     -- footer controls — fully touch-driven (no keys required)
     local ctrl = { hasPrev = false, hasNext = false }
     local pages = ui.pages[app.view] or 1
-    if app.view == 4 then
+    if app.view == VI.RESEARCH then
         -- research: legend in center, < > page when expanded branches overflow
-        ctrl.hasPrev = app.page[4] > 1
-        ctrl.hasNext = app.page[4] < pages
+        ctrl.hasPrev = app.page[VI.RESEARCH] > 1
+        ctrl.hasNext = app.page[VI.RESEARCH] < pages
         ctrl.center = function(y)
             local parts = { { THEME.good, "done" }, { THEME.warn, "wip" }, { THEME.info, "open" } }
             local tw = 0
@@ -1219,11 +1575,11 @@ local function handleTouch(side, x, y)
         return
     end
     -- 3. research: tap a branch summary line to expand/collapse it
-    if app.view == 4 and ui.research and ui.research.branches then
+    if app.view == VI.RESEARCH and ui.research and ui.research.branches then
         for _, b in ipairs(ui.research.branches) do
             if y == b.y then
                 app.expanded[b.name] = not app.expanded[b.name]
-                app.page[4] = 1          -- expanding changes line count; reset page
+                app.page[VI.RESEARCH] = 1          -- expanding changes line count; reset page
                 return
             end
         end
@@ -1235,10 +1591,12 @@ local function handleKey(k)
     elseif k == keys.left then selectView((app.view - 2) % #VIEWS + 1)
     elseif k == keys.up or k == keys.pageUp then onPage(-1)
     elseif k == keys.down or k == keys.pageDown then onPage(1)
-    elseif k == keys.one then selectView(1)
-    elseif k == keys.two then selectView(2)
-    elseif k == keys.three then selectView(3)
-    elseif k == keys.four then selectView(4)
+    elseif k == keys.one then selectView(VI.ACTION)
+    elseif k == keys.two then selectView(VI.DASH)
+    elseif k == keys.three then selectView(VI.BUILD)
+    elseif k == keys.four then selectView(VI.CITZ)
+    elseif k == keys.five then selectView(VI.WORK)
+    elseif k == keys.six then selectView(VI.RESEARCH)
     end
 end
 
@@ -1267,8 +1625,10 @@ local function main()
 
     Colony.init()
 
-    -- initial poll + draw
+    -- initial poll + draw + seed history
     Colony.refresh()
+    History.push(Colony.data)
+    Stuck.refresh(Colony.data and Colony.data.requests or {})
     render()
 
     local timer = os.startTimer(CONFIG.refreshInterval)
@@ -1277,6 +1637,8 @@ local function main()
         local e = event[1]
         if e == "timer" and event[2] == timer then
             Colony.refresh()
+            History.push(Colony.data)
+            Stuck.refresh(Colony.data and Colony.data.requests or {})
             render()
             timer = os.startTimer(CONFIG.refreshInterval)
         elseif e == "monitor_touch" then
@@ -1305,4 +1667,40 @@ local function main()
     print("Colony Monitor stopped.")
 end
 
-main()
+--===========================================================================
+-- SELF-CHECK  ·  `colony_monitor test` validates the pure-logic extras
+-- (sparkline shaping + stuck-request aging) without a colony or monitor.
+--===========================================================================
+local function _selftest()
+    local fail = 0
+    local function check(name, cond)
+        if cond then print("ok   " .. name) else print("FAIL " .. name); fail = fail + 1 end
+    end
+
+    -- sparkline: rising series should peak at the newest (rightmost) sample
+    local rising = sparkString(6, { 1, 2, 3, 4, 5, 6 })
+    check("spark rising peaks at right", rising:sub(-1) == "#")
+    check("spark width is exact", #rising == 6)
+    -- flat series fills width with a visible (non-blank) steady line
+    local flat = sparkString(5, { 7, 7, 7, 7, 7 })
+    check("spark flat fills width", #flat == 5)
+    check("spark flat is visible", flat:sub(1, 1) ~= " ")
+    -- empty series returns a blank strip of the requested width
+    check("spark empty is blank", sparkString(4, {}) == "    ")
+    -- stuck tracker: 11 polls under threshold, 12th trips, then clears
+    Stuck.sigs, Stuck.poll = {}, 0
+    Colony.resolveSource = function(raw) return tostring(raw or "?") end
+    local req = { { target = "Baker", name = "minecraft:wheat", state = "IN_PROGRESS" } }
+    for _ = 1, (CONFIG.stuckPolls - 1) do Stuck.refresh(req) end
+    check("not stuck below threshold", #Stuck.staleList() == 0)
+    Stuck.refresh(req)
+    check("stuck at threshold", #Stuck.staleList() == 1)
+    check("stuck item humanized", Stuck.staleList()[1].item == "Wheat")
+    Stuck.refresh({})   -- request resolved -> dropped
+    check("cleared after resolve", #Stuck.staleList() == 0)
+
+    print(fail == 0 and "ALL OK" or (fail .. " FAILED"))
+    return fail == 0
+end
+
+if CLI[1] == "test" then os.exit(_selftest() and 0 or 1) else main() end
