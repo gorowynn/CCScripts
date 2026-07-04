@@ -174,6 +174,8 @@ local surveyed     = false      -- hill: perimeter survey completed?
 local aborting     = false
 local chestsUsed   = 0
 local blockLog     = {}         -- block name (no namespace) -> count
+local fillerName   = nil        -- hill fill mode: item name to place in pits
+                                -- (nil = carve-only). Set from slot 3 at startup.
 
 -- terminal width cache (stock turtle is 39x13; no resize in CC:T)
 local TW = select(1, term.getSize()) or 39
@@ -324,6 +326,20 @@ local function niceName(id)
   return short
 end
 
+-- hill fill: pull a filler block from any loot slot matching fillerName.
+-- Returns true if a slot was selected, false if out of filler.
+local function selectFiller()
+  if not fillerName then return false end
+  for s = 3, 16 do
+    local item = turtle.getItemDetail(s)
+    if item and item.name == fillerName then
+      turtle.select(s)
+      return true
+    end
+  end
+  return false
+end
+
 local function noteBlock(info)
   if not info then return end
   local display = niceName(info.name)
@@ -451,6 +467,17 @@ local function dropLootAtHome()
            "Dumping loot into the room.")
   end
   for s = 3, 16 do
+    -- keep filler-type items in inventory for pit-filling; don't offload them
+    if fillerName then
+      local item = turtle.getItemDetail(s)
+      if item and item.name == fillerName then
+        -- skip: retained as filler stock
+      elseif turtle.getItemCount(s) > 0 then
+        goto drop
+      end
+      goto nextslot
+    end
+    ::drop::
     if turtle.getItemCount(s) > 0 then
       turtle.select(s)
       if groundFallback then
@@ -471,6 +498,7 @@ local function dropLootAtHome()
         end
       end
     end
+    ::nextslot::
   end
   turtle.select(1)
   if pos.x ~= 0 then
@@ -719,15 +747,48 @@ end
 
 -- Carve one column at (carveX, carveZ) down to target. The turtle is at the
 -- column at some height >= terrain top (after flying in). Manual descent so
--- we NEVER dig below the target surface (safeDown would eat into ground).
+-- we NEVER dig below the target surface. In fill mode (fillerName set), pits
+-- below the target are filled back up to the surface with filler blocks.
+local fillerWarned = false
 local function shaveColumn(target)
+  -- phase 1: descend to target, digging through material ABOVE target only
   while pos.y > target do
     local ok, info = turtle.inspectDown()
     if ok then noteBlock(info); turtle.digDown() end
     if turtle.down() then pos.y = pos.y - 1 else break end
   end
-  while pos.y < target do       -- pit: terrain below target; ascend (air)
-    if turtle.up() then pos.y = pos.y + 1 else break end
+  if not fillerName then
+    -- carve-only: ascend to target if we undershot (air pocket)
+    while pos.y < target do
+      if turtle.up() then pos.y = pos.y + 1 else break end
+    end
+    return
+  end
+  -- fill mode: if the cell below target isn't solid, it's a pit — descend to
+  -- the floor then place filler upward until the surface block sits at target-1.
+  local ok, info = turtle.inspectDown()
+  if ok and isGroundSolid(info.name) then return end   -- surface already there
+  -- descend to pit floor (don't dig — we want to fill, not deepen)
+  while true do
+    local detOk, detInfo = turtle.inspectDown()
+    if detOk and isGroundSolid(detInfo.name) then break end
+    if not turtle.down() then break end
+    pos.y = pos.y - 1
+  end
+  -- place filler going up until the turtle stands at target on a fresh block
+  while pos.y < target do
+    if not turtle.up() then break end
+    pos.y = pos.y + 1
+    if selectFiller() then
+      turtle.placeDown()   -- fills cell at pos.y - 1
+      turtle.select(1)
+    else
+      if not fillerWarned then
+        notify("WARN", "Out of filler blocks! Pits will be left unfilled.")
+        fillerWarned = true
+      end
+      turtle.select(1)
+    end
   end
 end
 
@@ -781,6 +842,16 @@ local function fuelNeeded()
 end
 
 refuelFrom(FUEL_SLOT)   -- greedy: burn everything in the dedicated fuel slot
+-- hill fill mode: if slot 3 holds a block on startup, use it as the filler
+-- type and pull matching blocks from anywhere in the inventory when filling pits.
+if mode == "hill" then
+  local item = turtle.getItemDetail(3)
+  if item and item.name then
+    fillerName = item.name
+    log(("Fill mode: %s (from slot 3, pulled from any slot)"):format(
+        niceName(fillerName)))
+  end
+end
 do
   local have  = turtle.getFuelLevel()
   local need  = fuelNeeded()
