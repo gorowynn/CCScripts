@@ -12,27 +12,27 @@
   mines a 1x1 shaft UP through HEIGHT at the first floor cell, steps sideways
   at the TOP to the next cell, mines DOWN, steps sideways at the FLOOR, mines
   UP, and so on. Every block is mined with exactly one move into it — no
-  wasted descent. Across the W x L floor the path also snakes (length
-  direction reverses each width row).
+  wasted descent. Across the W x L floor the path also snakes.
 
-  === HILL ===  carve a sloped hillside / ramp (carve only, no placing).
-  Turtle starts at the LOW edge, ground level, facing UPHILL (+z).
+  === HILL ===  smooth the interior terrain to match the outside perimeter.
+  Turtle starts at the (0,0) corner of a W x L rectangle, ground level.
 
     WIDTH  = blocks across  (left/right)
-    LENGTH = slope length   (face this way at start; rises in this direction)
-    HIGH    = total rise    (how many blocks higher the high edge is vs start)
+    LENGTH = blocks forward  (face this way at start)
 
-  The ramp surface rises linearly from 0 at the low edge to HIGH at the far
-  edge, plus a small per-cell jitter (±1, deterministic) so the result looks
-  naturally rough rather than a sterile diagonal. The turtle removes every
-  block ABOVE the surface, leaving the ramp. Material at/below the surface
-  is untouched. Existing air is skipped.
-  ponytail: processed layer-by-layer top-down; each layer is a per-column
-  carve length swept in a boustrophedon. Layers shrink as we descend. The
-  jitter makes the high edge ragged rather than straight. Repositioning
-  between layers goes through carved air via goTo — ~40% extra moves vs a
-  perfect variable-height wave, but the wave has off-by-one traps at surface
-  steps whereas layers never put the turtle inside material.
+  Two phases:
+    1. SURVEY — walk the outside ring (the cells just beyond the rectangle),
+       probing each cell's ground height by descending to the floor WITHOUT
+       digging (non-destructive: terrain is climbed over, never carved).
+    2. CARVE  — for each interior column, smoothstep+bilinear-blend the four
+       edge samples into a target surface height, then shave the column down
+       to that height. Carve-only: pits below the target surface are left.
+
+  The result is a smooth basin/ramp that meets the surrounding ground at every
+  edge, with no hard ridge. ponytail: column-wave carve (fly to each column's
+  terrain top, descend-digging to target, never touching ground below target).
+  A layer model can't express arbitrary non-monotonic surfaces; columns are
+  independent and correct.
 
   === Inventory (both modes) ===
     slot 1 = FUEL  only (never dropped as loot, never mined into)
@@ -45,11 +45,12 @@
       chains them, ground-dump fallback if out of chests), then resumes at the
       exact cell it left off
     - Resume after restart: progress saved to .dig_shape_state each step;
-      re-running with the same dims+mode resumes, else starts fresh
+      re-running with the same dims+mode resumes (hill skips the survey too),
+      else starts fresh
     - Block logging: every block is inspected before digging; all blocks are
       tallied and reported at the end, shown live
     - Gravel/falling-block re-dig, live status display with live block
-      counts, chat alerts
+      counts + ETA, chat alerts
 
   Alerts: uses a Plethora/Sc-Peripherals `chatBox` if present, else falls
   back to `rednet.broadcast` if a modem is attached, else just prints.
@@ -61,7 +62,7 @@
 local args = { ... }
 
 -- --- argument parsing: CLI if given, else interactive guided prompts -----
-local WIDTH, HEIGHT, LENGTH, HIGH
+local WIDTH, HEIGHT, LENGTH
 local mode = "room"   -- "room" or "hill"; CLI defaults to room
 
 local function readNumber(prompt)
@@ -112,24 +113,18 @@ else
   print("=== dig_shape guided setup ===")
   print("")
   local shape = readChoice("Mine which shape?", {
-    { label = "rectangular room",                value = "room" },
-    { label = "sloped hillside/ramp (carve only)", value = "hill" },
+    { label = "rectangular room",                              value = "room" },
+    { label = "smooth terrain to perimeter (probe + carve)",   value = "hill" },
   })
   if not shape then return end   -- EOF
   mode = shape
   print("")
   WIDTH  = readNumber("Width  (blocks across, left/right):  ")
   LENGTH = readNumber("Length (blocks forward, face this way): ")
-  if mode == "hill" then
-    HIGH = readNumber("Rise   (height of high edge above start): ")
-    if not (WIDTH and LENGTH and HIGH) then return end
-    if HIGH < 1 then
-      printError("rise must be a positive integer (use 'room' for a flat dig)")
-      return
-    end
-  else
+  if not (WIDTH and LENGTH) then return end
+  if mode == "room" then
     HEIGHT = readNumber("Height (blocks up, 1 ok):            ")
-    if not (WIDTH and HEIGHT and LENGTH) then return end
+    if not HEIGHT then return end
     if WIDTH * HEIGHT * LENGTH < 2 then
       printError("1x1x1 has nothing to dig (the turtle is already in the only cell).")
       printError("Increase at least one dimension.")
@@ -161,11 +156,9 @@ local function notify(level, msg)
 end
 
 -- --- run state (declared early so display/loops close over it) ---------
-local totalColumns = WIDTH * LENGTH                  -- room progress total
-local doneColumns  = 0                               -- room progress done
-local totalLayers  = (mode == "hill") and HIGH or 0  -- hill progress total
-local doneLayers   = 0                               -- hill progress done
-local startTime    = os.clock()                       -- for ETA (process time)
+local totalColumns = WIDTH * LENGTH   -- progress total (both modes)
+local doneColumns  = 0                -- progress done
+local startTime    = os.clock()       -- for ETA (process time)
 local pos          = { x = 0, y = 0, z = 0 }
 local heading      = { x = 0, z = 1 }
 -- room sweep cursors
@@ -173,18 +166,20 @@ local w            = 0          -- current width index  [0..WIDTH-1]
 local l            = 0          -- current length index [0..LENGTH-1]
 local lengthDir    = 1          -- +1 or -1 (snake direction along z)
 local goingUp      = true       -- vertical direction of the current column
--- hill sweep cursor
-local hillY        = HIGH or 0  -- current layer being carved [HIGH..1]
+-- hill cursors
+local carveX       = 0          -- next interior column to carve [0..WIDTH-1]
+local carveZ       = 0          -- [0..LENGTH-1]
+local carveDir     = 1          -- +1 / -1 along z within a width row
+local surveyed     = false      -- hill: perimeter survey completed?
 local aborting     = false
 local chestsUsed   = 0
 local blockLog     = {}         -- block name (no namespace) -> count
 
--- ponytail: terminal width is tiny (39x13 on a stock turtle). Cache it once;
--- CC:T doesn't support terminal resize, so this is safe.
+-- terminal width cache (stock turtle is 39x13; no resize in CC:T)
 local TW = select(1, term.getSize()) or 39
-local function trunc(s, w)
-  w = w or TW
-  return #s <= w and s or s:sub(1, w)
+local function trunc(s, width)
+  width = width or TW
+  return #s <= width and s or s:sub(1, width)
 end
 
 -- --- live status display ----------------------------------------------
@@ -199,19 +194,15 @@ end
 local function setStatus(msg)
   term.setCursorPos(1, 1); term.clearLine(); term.write(trunc(msg or ""))
   term.setCursorPos(1, 2); term.clearLine()
-  local done, total
-  if mode == "hill" then done, total = doneLayers, totalLayers
-  else                  done, total = doneColumns, totalColumns end
   term.write(trunc(("Progress: %d / %d  (%d%%)"):format(
-        done, total, math.floor(done / total * 100))))
-  -- ETA: average process-time per unit so far * remaining.
+        doneColumns, totalColumns,
+        math.floor(doneColumns / totalColumns * 100))))
   -- ponytail: os.clock() is CPU time, excludes sleep/idle (e.g. fuel pause),
   -- so ETA skews low during waits — acceptable on a small terminal.
   term.setCursorPos(1, 3); term.clearLine()
   local elapsed = os.clock() - startTime
-  local eta = (done > 0) and (elapsed / done) * (total - done) or nil
+  local eta = (doneColumns > 0) and (elapsed / doneColumns) * (totalColumns - doneColumns) or nil
   local etaStr = eta and (" ETA %s"):format(fmtTime(eta)) or ""
-  -- Fuel number can be huge; truncate the whole line to terminal width.
   term.write(trunc(("Fuel: %s%s"):format(tostring(turtle.getFuelLevel()), etaStr)))
 end
 
@@ -236,8 +227,8 @@ local function drawBlockCounts()
   for _, n in ipairs(names) do
     if y > last then break end
     term.setCursorPos(1, y)
-    -- ponytail: "name xNNNN" must fit terminal width; truncate the NAME
-    -- (right-trim with ellipsis if needed), keep the count visible.
+    -- ponytail: "name xNNNN" must fit terminal width; truncate the NAME,
+    -- keep the count visible.
     local suffix = (" x%d"):format(blockLog[n])
     local maxName = TW - #suffix
     local display = (#n <= maxName) and n or (n:sub(1, maxName - 1) .. "~")
@@ -247,12 +238,12 @@ local function drawBlockCounts()
 end
 
 -- --- state persistence ------------------------------------------------
-local function saveState()
+local function saveState(extra)
   local f = fs.open(STATE_FILE, "w")
   if not f then return end
-  f.write(textutils.serialize({
+  local tbl = {
     mode         = mode,
-    dims         = { WIDTH, HIGH or HEIGHT, LENGTH },
+    dims         = { WIDTH, HEIGHT or 0, LENGTH },
     pos          = pos,
     heading      = heading,
     -- room cursors
@@ -260,15 +251,20 @@ local function saveState()
     l            = l,
     lengthDir    = lengthDir,
     goingUp      = goingUp,
-    doneColumns  = doneColumns,
-    -- hill cursor
-    hillY        = hillY,
-    doneLayers   = doneLayers,
+    -- hill cursors
+    carveX       = carveX,
+    carveZ       = carveZ,
+    carveDir     = carveDir,
+    surveyed     = surveyed,
+    perimeter    = (mode == "hill") and _G.perimeterHeights or nil,
     -- shared
+    doneColumns  = doneColumns,
     aborting     = aborting,
     chestsUsed   = chestsUsed,
     blockLog     = blockLog,
-  }))
+  }
+  for k, v in pairs(extra or {}) do tbl[k] = v end
+  f.write(textutils.serialize(tbl))
   f.close()
 end
 
@@ -286,26 +282,21 @@ local function tryResume()
   if not ok or type(data) ~= "table" or not data.dims then return false end
   if data.mode ~= mode then return false end   -- different mode; start fresh
   local d = data.dims
-  if d[1] ~= WIDTH or d[2] ~= (HIGH or HEIGHT) or d[3] ~= LENGTH then
-    return false   -- different job; caller will start fresh
-  end
+  if d[1] ~= WIDTH or d[3] ~= LENGTH then return false end
+  if mode == "room" and d[2] ~= HEIGHT then return false end
   pos, heading     = data.pos, data.heading
   w, l, lengthDir  = data.w, data.l, data.lengthDir
   goingUp          = data.goingUp
   if goingUp == nil then goingUp = true end
+  carveX, carveZ, carveDir = data.carveX or 0, data.carveZ or 0, data.carveDir or 1
+  surveyed         = data.surveyed or false
   doneColumns      = data.doneColumns or 0
-  hillY            = data.hillY or (HIGH or 0)
-  doneLayers       = data.doneLayers or 0
   aborting         = data.aborting or false
   chestsUsed       = data.chestsUsed or 0
   blockLog         = data.blockLog or data.oreLog or {}
-  if mode == "hill" then
-    notify("RESUME", ("Resuming hill at layer y=%d (%d/%d layers)")
-           :format(hillY, doneLayers, totalLayers))
-  else
-    notify("RESUME", ("Resuming at W%d L%d (%d/%d columns)")
-           :format(w + 1, l + 1, doneColumns, totalColumns))
-  end
+  if mode == "hill" and data.perimeter then _G.perimeterHeights = data.perimeter end
+  notify("RESUME", ("Resuming %s at column %d/%d"):format(
+         mode, doneColumns, totalColumns))
   return true
 end
 
@@ -322,24 +313,17 @@ end
 
 -- --- block logging ----------------------------------------------------
 -- ponytail: CC:T turtle.inspect() has no displayName for blocks, so derive a
--- readable name from the registry id: strip ANY namespace (everything up to
--- and including the last ':'), swap '_' for spaces, Title Case. True
--- localization would need a hardcoded table or the commands API (command
--- computer only) — not worth it here.
+-- readable name from the registry id: strip ANY namespace, swap '_' for
+-- spaces, Title Case.
 local function niceName(id)
   if not id then return "" end
-  local short = id:gsub("^.*:", "")      -- strip any namespace
-  short = short:gsub("_", " ")          -- snake_case -> spaces
-  short = short:gsub("%a", function(c)  -- Title Case each word
-    return c:upper()
-  end, 1)
-  -- capitalize after each space too
+  local short = id:gsub("^.*:", "")
+  short = short:gsub("_", " ")
+  short = short:gsub("%a", function(c) return c:upper() end, 1)
   short = short:gsub(" (%a)", function(c) return c:upper() end)
   return short
 end
 
--- Tally every mined block by nice name; the live count panel redraws on
--- every block so counts are always current.
 local function noteBlock(info)
   if not info then return end
   local display = niceName(info.name)
@@ -361,13 +345,12 @@ local function digUntilClear(detect, dig, inspectFn)
 end
 
 -- ponytail: one table-driven mover replaces three near-identical functions.
--- All three directions share the same out-of-fuel pause-for-key behaviour.
 local MOVERS = {
-  forward = { name = "forward", detect = turtle.detect,  dig = turtle.dig,  insp = turtle.inspect,
+  forward = { name = "forward", detect = turtle.detect,     dig = turtle.dig,     insp = turtle.inspect,
               move = turtle.forward },
-  up      = { name = "up",      detect = turtle.detectUp, dig = turtle.digUp, insp = turtle.inspectUp,
+  up      = { name = "up",      detect = turtle.detectUp,    dig = turtle.digUp,    insp = turtle.inspectUp,
               move = turtle.up },
-  down    = { name = "down",    detect = turtle.detectDown, dig = turtle.digDown, insp = turtle.inspectDown,
+  down    = { name = "down",    detect = turtle.detectDown,  dig = turtle.digDown,  insp = turtle.inspectDown,
               move = turtle.down },
 }
 
@@ -437,7 +420,7 @@ local function ensureChestAhead()
   if turtle.detect() then
     local ok, info = turtle.inspect()
     if ok and info and info.name == "minecraft:chest" then return true end
-    return false   -- non-chest block in the way; can't loot here
+    return false
   end
   if turtle.getItemCount(CHEST_SLOT) == 0 then return false end
   turtle.select(CHEST_SLOT)
@@ -452,9 +435,7 @@ local function ensureChestAhead()
 end
 
 -- Assumes turtle is at (0,0,0). Tries to place/reuse a chest facing the
--- entrance (-z) first; falls back to the interior (+z), guaranteed carved
--- air with a solid floor. When a chest fills, chains a new one along +x.
--- If no chest can be placed or slot 2 runs out, dumps loot as a last resort.
+-- entrance (-z) first; falls back to the interior (+z). Chains along +x.
 -- Leaves the turtle back at (0,0,0) facing +z.
 local function dropLootAtHome()
   local chestDirs = { { x = 0, z = -1 }, { x = 0, z = 1 } }
@@ -469,7 +450,6 @@ local function dropLootAtHome()
     notify("WARN", "Could not place a chest (slot 2 empty or blocked both ways). " ..
            "Dumping loot into the room.")
   end
-
   for s = 3, 16 do
     if turtle.getItemCount(s) > 0 then
       turtle.select(s)
@@ -478,13 +458,10 @@ local function dropLootAtHome()
       else
         while turtle.getItemCount(s) > 0 do
           if turtle.drop() then
-            -- slot emptied into the chest
           else
-            -- chest full: chain a new one along +x
             if turtle.getItemCount(CHEST_SLOT) == 0 then
               notify("WARN", "Ran out of chests! Dumping remaining loot on the ground.")
-              groundFallback = true
-              break
+              groundFallback = true; break
             end
             turnTo({ x = 1, z = 0 })
             if not step() then break end
@@ -525,8 +502,6 @@ local function offloadIfFull(returnDir)
 end
 
 -- === ROOM =============================================================
--- Mine one column in the given vertical direction. Returns false on stuck.
--- For HEIGHT==1 this is a no-op (the cell is already air under the turtle).
 local function mineColumn(up)
   if up then
     for _ = 2, HEIGHT do
@@ -557,13 +532,11 @@ local function digRoom()
     while l < LENGTH do
       if aborting then break end
       if not offloadIfFull({ x = 0, z = lengthDir }) then break end
-
       setStatus(("Digging column W%d L%d (%s)"):format(
             w + 1, l + 1, goingUp and "up" or "down"))
       if not mineColumn(goingUp) then break end
       doneColumns = doneColumns + 1
       goingUp = not goingUp
-
       l = l + 1
       if l < LENGTH then
         setStatus(("Moving to L%d"):format(l + 1))
@@ -572,7 +545,6 @@ local function digRoom()
       saveState()
     end
     if aborting then break end
-
     l = 0
     w = w + 1
     if w < WIDTH then
@@ -586,106 +558,174 @@ local function digRoom()
 end
 
 -- === HILL =============================================================
--- Per-column peak height via value noise. The ridge line (high edge)
--- undulates across the width so the hill looks naturally rough — goes up
--- AND down — instead of a sterile diagonal that only builds up.
--- ponytail: each column rises monotonically 0 -> colPeak(x). Dips ALONG the
--- slope (non-monotonic in li) would leave solid walls mid-room that trap the
--- turtle under the layer-carve model, so the variation lives across the
--- width. No bit ops (Lua 5.1/CC:T safe); deterministic, resume-safe.
-local PEAK_AMP = math.max(1, math.floor((HIGH or 0) / 3))   -- relief in blocks
+-- Smooth the interior to the outside perimeter's ground heights.
+perimeterHeights = {}   -- ["x,z"] -> ground air-cell height (relative to start)
+local function pkey(x, z) return x .. "," .. z end
 
-local function colPeak(x)
-  if WIDTH <= 1 then return HIGH end
-  local spacing = 2
-  local i0 = math.floor(x / spacing) * spacing
-  local i1 = i0 + spacing
-  local function cp(ix)
-    local h = ((ix + 101) * 73856093) % 2147483647
-    return (HIGH - PEAK_AMP) + (h % (2 * PEAK_AMP + 1))   -- [HIGH-amp, HIGH+amp]
+local function smoothstep(t) return t * t * (3 - 2 * t) end
+
+-- Probe the ground height at the current (x,z): descend through AIR (no dig)
+-- until solid below, return the air-cell height above it, restore position.
+-- ponytail: survey must not modify terrain, so never digs. If the turtle is
+-- below the surface (in a hole), it can't see up; rare for surface smoothing.
+local function probeGround()
+  local drops = 0
+  while not turtle.detectDown() and drops < 256 do
+    if not turtle.down() then break end
+    pos.y = pos.y - 1
+    drops = drops + 1
   end
-  if i1 > WIDTH - 1 then return cp(i0) end
-  local v0, v1 = cp(i0), cp(i1)
-  local t = (x - i0) / spacing
-  return math.floor(v0 + (v1 - v0) * t + 0.5)
-end
-
--- Highest peak across all columns; hill layers run 1..maxPeak.
-local maxPeak = HIGH or 0
-if mode == "hill" then
-  for x = 0, WIDTH - 1 do maxPeak = math.max(maxPeak, colPeak(x)) end
-  totalLayers = maxPeak
-end
-
--- Ramp surface height at cell (x, li): rises 0 -> colPeak(x) along the slope.
-local function hillSurface(x, li)
-  if LENGTH <= 1 then return colPeak(x) end
-  return math.floor(colPeak(x) * li / (LENGTH - 1) + 0.5)
-end
-
--- Largest length-index (inclusive) whose surface at column x is below layer y.
--- Cells [0..lMax] at column x, layer y need carving; beyond is surface/soil.
-local function hillLMax(x, y)
-  local lMax = -1
-  for li = 0, LENGTH - 1 do
-    if hillSurface(x, li) < y then lMax = li end
+  local groundY = pos.y
+  for _ = 1, drops do
+    if turtle.up() then pos.y = pos.y + 1 end
   end
-  return lMax
+  return groundY
 end
 
--- Carve column x from z=0..lMax at the current height (pos.y). Returns false
--- on stuck/abort. The per-column lMax is what gives the high edge its ragged,
--- natural variation across the width.
-local function sweepColumn(x, lMax, sdir)
-  local target = (sdir == 1) and lMax or 0
-  -- if we're resuming mid-column, the turtle may already be past/short of
-  -- target; the while loop below handles both by walking to target.
-  turnTo({ x = 0, z = sdir })
-  while pos.z ~= target do
-    if not offloadIfFull({ x = 0, z = sdir }) then return false end
-    if not step() then return false end
+-- Move one cell along heading, climbing OVER obstacles without digging
+-- forward (preserves terrain). Returns false if it can't clear (overhang).
+local function flyMove()
+  local tries = 0
+  while not turtle.forward() do
+    if turtle.detect() then
+      if not turtle.up() then return false end   -- can't climb (overhang/ceiling)
+      pos.y = pos.y + 1
+    else
+      return false   -- entity or unknown obstruction
+    end
+    tries = tries + 1
+    if tries > 80 then return false end
+  end
+  pos.x = pos.x + heading.x
+  pos.z = pos.z + heading.z
+  return true
+end
+
+local function flyStep(dir)
+  turnTo(dir)
+  return flyMove()
+end
+
+-- Navigate horizontally to (tx,tz) by climbing over terrain, never digging
+-- forward (preserves ground). Vertical (pos.y) is left as-is. The caller
+-- shaves down to target afterwards, so crossing above terrain is correct.
+local function flyTo(tx, tz)
+  if pos.x < tx then turnTo({ x = 1, z = 0 })
+  elseif pos.x > tx then turnTo({ x = -1, z = 0 }) end
+  while pos.x ~= tx do if not flyMove() then return false end end
+  if pos.z < tz then turnTo({ x = 0, z = 1 })
+  elseif pos.z > tz then turnTo({ x = 0, z = -1 }) end
+  while pos.z ~= tz do if not flyMove() then return false end end
+  return true
+end
+
+local function probeHere()
+  perimeterHeights[pkey(pos.x, pos.z)] = probeGround()
+end
+
+-- Walk one edge: probe current cell, then move `steps` cells in dir, probing
+-- each arrival. Returns false on fly failure.
+local function walkEdge(dir, steps)
+  probeHere()
+  for _ = 1, steps do
+    if not flyStep(dir) then return false end
+    probeHere()
   end
   return true
 end
 
-local function fuelNeededHill()
-  local cells = 0
-  for y = 1, maxPeak do
-    for x = 0, WIDTH - 1 do
-      cells = cells + (hillLMax(x, y) + 1)
+-- Run the perimeter survey. On completion the turtle is back near (0,0).
+local function runSurvey()
+  notify("SURVEY", "Probing outside perimeter (non-destructive)...")
+  -- position at outside corner (-1,-1)
+  flyStep({ x = -1, z = 0 }); flyStep({ x = 0, z = -1 })
+  walkEdge({ x = 1, z = 0 }, WIDTH + 1)   -- south edge z=-1, x: -1..W   -> (W,-1)
+  walkEdge({ x = 0, z = 1 }, LENGTH + 1)  -- east  edge x= W, z: -1..L  -> (W,L)
+  walkEdge({ x = -1, z = 0 }, WIDTH + 1)  -- north edge z= L, x:  W..-1 -> (-1,L)
+  walkEdge({ x = 0, z = -1 }, LENGTH + 1) -- west  edge x=-1, z:  L..-1 -> (-1,-1)
+  -- step into the interior corner (0,0)
+  flyStep({ x = 1, z = 0 }); flyStep({ x = 0, z = 1 })
+  surveyed = true
+  notify("SURVEY", ("Done: %d perimeter cells probed."):format(
+         (function() local n=0 for _ in pairs(perimeterHeights) do n=n+1 end return n end)()))
+end
+
+-- Build the interior target-surface table by smoothstep+bilinear blend of
+-- the four edge samples. surface[x][z] = target air-cell height.
+local function buildSurface()
+  local surf = {}
+  for x = 0, WIDTH - 1 do
+    surf[x] = {}
+    local hS = perimeterHeights[pkey(x, -1)]
+    local hN = perimeterHeights[pkey(x, LENGTH)]
+    local tx = (WIDTH > 1) and smoothstep(x / (WIDTH - 1)) or 0.5
+    for z = 0, LENGTH - 1 do
+      local hW = perimeterHeights[pkey(-1, z)]
+      local hE = perimeterHeights[pkey(WIDTH, z)]
+      local tz = (LENGTH > 1) and smoothstep(z / (LENGTH - 1)) or 0.5
+      local hNS = hS + (hN - hS) * tz
+      local hWE = hW + (hE - hW) * tx
+      surf[x][z] = math.floor((hNS + hWE) / 2 + 0.5)
     end
   end
-  local ascend  = maxPeak
-  local goHome  = WIDTH + LENGTH + maxPeak   -- worst-case reposition/return
-  return cells + ascend + goHome
+  return surf
+end
+
+-- Carve one column at (carveX, carveZ) down to target. The turtle is at the
+-- column at some height >= terrain top (after flying in). Manual descent so
+-- we NEVER dig below the target surface (safeDown would eat into ground).
+local function shaveColumn(target)
+  while pos.y > target do
+    local ok, info = turtle.inspectDown()
+    if ok then noteBlock(info); turtle.digDown() end
+    if turtle.down() then pos.y = pos.y - 1 else break end
+  end
+  while pos.y < target do       -- pit: terrain below target; ascend (air)
+    if turtle.up() then pos.y = pos.y + 1 else break end
+  end
+end
+
+local surface = {}   -- filled after survey / on resume
+
+local function fuelNeededHill()
+  -- ponytail: rough. Survey ~ 4*(W+L) probe cells; carve ~ W*L * guessed
+  -- average height (use LENGTH as a loose stand-in). Real cost depends on
+  -- terrain shape and is unknown pre-dig.
+  local survey  = 4 * (WIDTH + LENGTH) * 2
+  local carve   = WIDTH * LENGTH * math.max(1, math.floor(LENGTH / 2))
+  local goHome  = WIDTH + LENGTH + 16
+  return survey + carve + goHome
 end
 
 local function digHill()
-  -- ascend to the top layer at the low-edge corner (digs through any material)
-  for _ = 1, maxPeak do
-    if not safeUp() then return end
-    pos.y = pos.y + 1
-  end
-  while hillY >= 1 do
-    if aborting then break end
-    if not goTo(0, hillY, 0) then break end
-    setStatus(("Carving layer y=%d"):format(hillY))
-    local sdir = 1
-    for col = 0, WIDTH - 1 do
-      if aborting then break end
-      local lMax = hillLMax(col, hillY)
-      if lMax >= 0 then
-        if not sweepColumn(col, lMax, sdir) then break end
-      end
-      if col < WIDTH - 1 then
-        turnTo({ x = 1, z = 0 })
-        if not step() then break end
-        sdir = -sdir
-      end
-    end
-    doneLayers = doneLayers + 1
-    hillY = hillY - 1
+  if not surveyed then
+    runSurvey()
+    surface = buildSurface()
     saveState()
+    if aborting then return end
+  end
+  -- boustrophedon over interior columns. Resume continues from (carveX,carveZ).
+  while carveX < WIDTH do
+    if aborting then break end
+    while (carveDir == 1 and carveZ <= LENGTH - 1) or (carveDir == -1 and carveZ >= 0) do
+      if aborting then break end
+      if not offloadIfFull({ x = 0, z = carveDir }) then break end
+      -- fly to (carveX, carveZ) over terrain (no ground dig), then shave down
+      if not flyTo(carveX, carveZ) then break end
+      setStatus(("Smoothing column W%d L%d"):format(carveX + 1, carveZ + 1))
+      shaveColumn(surface[carveX][carveZ])
+      doneColumns = doneColumns + 1
+      carveZ = carveZ + carveDir
+      saveState()
+    end
+    if aborting then break end
+    -- advance one width row, reverse z direction
+    carveX = carveX + 1
+    if carveX < WIDTH then
+      carveZ = (carveDir == 1) and (LENGTH - 1) or 0
+      carveDir = -carveDir
+      saveState()
+    end
   end
 end
 
@@ -700,14 +740,13 @@ do
   local need  = fuelNeeded()
   local level = (have == "unlimited") and math.huge or have
   if level < need then
-    -- warn but proceed; the turtle will pause for fuel mid-dig when it runs out
     notify("FUEL", ("Need ~%d fuel, have %s. Starting anyway; will pause for refuel.")
            :format(need, tostring(have)))
   end
   term.clear()
   if mode == "hill" then
-    log(("Hill %dx%d rise %d  (need ~%d fuel, have %s)"):format(
-          WIDTH, LENGTH, HIGH, need, tostring(have)))
+    log(("Hill %dx%d  (rough need ~%d fuel, have %s)"):format(
+          WIDTH, LENGTH, need, tostring(have)))
   else
     log(("Room %dx%dx%d  (need ~%d fuel, have %s)"):format(
           WIDTH, HEIGHT, LENGTH, need, tostring(have)))
@@ -716,20 +755,19 @@ end
 
 -- start or resume
 if not tryResume() then
-  clearState()   -- discard any stale state from a different job
+  clearState()
   pos, heading   = { x = 0, y = 0, z = 0 }, { x = 0, z = 1 }
   w, l, lengthDir, goingUp = 0, 0, 1, true
-  hillY, doneLayers = maxPeak, 0
+  carveX, carveZ, carveDir, surveyed = 0, 0, 1, false
   doneColumns, aborting, chestsUsed, blockLog = 0, false, 0, {}
+  if mode == "hill" then perimeterHeights = {} end
 end
+-- hill: rebuild surface table from probed heights (or empty if not surveyed)
+if mode == "hill" and surveyed then surface = buildSurface() end
 saveState()
 
 -- --- main dig dispatch ------------------------------------------------
-if mode == "hill" then
-  digHill()
-else
-  digRoom()
-end
+if mode == "hill" then digHill() else digRoom() end
 
 -- --- return to start ---------------------------------------------------
 if aborting then
@@ -739,7 +777,7 @@ else
   setStatus("Returning to start...")
 end
 goTo(0, 0, 0)
-turnTo({ x = 0, z = -1 })   -- face the entrance (-z) for the final drop
+turnTo({ x = 0, z = -1 })
 
 -- --- drop loot ---------------------------------------------------------
 setStatus("Dropping loot...")
@@ -754,11 +792,8 @@ table.sort(blockBits)
 local blockSummary = (#blockBits > 0)
   and (" | mined: " .. table.concat(blockBits, ", ")) or ""
 
-local progressWord = (mode == "hill") and "layers" or "columns"
-local doneCount    = (mode == "hill") and doneLayers or doneColumns
-local totalCount   = (mode == "hill") and totalLayers or totalColumns
-local summary = ("Done. %d/%d %s, %d chest(s) used.%s%s"):format(
-  doneCount, totalCount, progressWord, chestsUsed,
+local summary = ("Done. %d/%d columns, %d chest(s) used.%s%s"):format(
+  doneColumns, totalColumns, chestsUsed,
   aborting and " (ABORTED early)" or "", blockSummary)
 setStatus(summary)
 notify("DONE", summary)
