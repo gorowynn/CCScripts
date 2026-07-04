@@ -689,15 +689,25 @@ end
 -- Build the interior target-surface table by smoothstep+bilinear blend of
 -- the four edge samples. surface[x][z] = target air-cell height.
 local function buildSurface()
+  -- Average of all probed heights; used as fallback for cells the survey
+  -- couldn't reach (obstacle aborted an edge mid-walk).
+  local sum, count = 0, 0
+  for _, h in pairs(perimeterHeights) do sum = sum + h; count = count + 1 end
+  local avg = (count > 0) and (sum / count) or 0
+  local function H(x, z)
+    local v = perimeterHeights[pkey(x, z)]
+    if v == nil then return avg end
+    return v
+  end
   local surf = {}
   for x = 0, WIDTH - 1 do
     surf[x] = {}
-    local hS = perimeterHeights[pkey(x, -1)]
-    local hN = perimeterHeights[pkey(x, LENGTH)]
+    local hS = H(x, -1)
+    local hN = H(x, LENGTH)
     local tx = (WIDTH > 1) and smoothstep(x / (WIDTH - 1)) or 0.5
     for z = 0, LENGTH - 1 do
-      local hW = perimeterHeights[pkey(-1, z)]
-      local hE = perimeterHeights[pkey(WIDTH, z)]
+      local hW = H(-1, z)
+      local hE = H(WIDTH, z)
       local tz = (LENGTH > 1) and smoothstep(z / (LENGTH - 1)) or 0.5
       local hNS = hS + (hN - hS) * tz
       local hWE = hW + (hE - hW) * tx
