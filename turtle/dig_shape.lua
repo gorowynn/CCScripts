@@ -580,6 +580,13 @@ local function fuelNeededRoom()
 end
 
 local function digRoom()
+  -- On resume, navigate from the home corner back to the saved column cursor
+  -- before continuing. The turtle must be physically at the start corner.
+  if doneColumns > 0 and not (w == 0 and l == 0) then
+    setStatus(("Resuming: navigating to W%d L%d..."):format(w + 1, l + 1))
+    if not goTo(w, 0, l) then return end
+    turnTo({ x = 0, z = lengthDir })
+  end
   while w < WIDTH do
     if aborting then break end
     turnTo({ x = 0, z = lengthDir })
