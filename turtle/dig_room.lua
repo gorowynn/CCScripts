@@ -67,7 +67,8 @@ local function readChoice(prompt, options)
     io.write("Choice [1-" .. #options .. "]: ")
     local s = io.read()
     if not s then return nil end
-    local n = tonumber(s:gsub("^%s+", ""):gsub("%s+$", ""))
+    s = s:gsub("^%s+", ""):gsub("%s+$", "")
+    local n = tonumber(s)
     if n and n >= 1 and n <= #options then return options[n].value end
     print("  invalid choice")
   end
