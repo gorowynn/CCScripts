@@ -289,11 +289,17 @@ local function tryResume()
   -- opt-in: never silently resume. Ask the user first.
   local dc = data.doneColumns or 0
   print(("Found in-progress %s job: %d/%d columns done."):format(mode, dc, totalColumns))
+  print("To resume: place the turtle back at the ORIGINAL start corner,")
+  print("           facing the ORIGINAL start direction, before answering.")
   io.write("Resume it? [y/N]: ")
   local s = io.read()
   if not s or s:sub(1,1):lower() ~= "y" then return false end   -- start fresh
-  pos, heading     = data.pos, data.heading
-  w, l, lengthDir  = data.w, data.l, data.lengthDir
+  -- RE-ANCHOR: ignore saved pos/heading. The dig loop navigates fresh from
+  -- (0,0,0) to the saved carve cursor, so resume works as long as the turtle
+  -- is physically back at the home corner facing +z (the canonical start).
+  -- This is robust to the turtle having been moved/rotated while powered off.
+  pos, heading     = { x = 0, y = 0, z = 0 }, { x = 0, z = 1 }
+  w, l, lengthDir  = data.w or 0, data.l or 0, data.lengthDir or 1
   goingUp          = data.goingUp
   if goingUp == nil then goingUp = true end
   carveX, carveZ, carveDir = data.carveX or 0, data.carveZ or 0, data.carveDir or 1
