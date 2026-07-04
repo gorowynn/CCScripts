@@ -244,13 +244,30 @@ local function refuelFrom(slot, target)
 end
 
 -- --- block logging ----------------------------------------------------
+-- ponytail: CC:T turtle.inspect() has no displayName for blocks, so derive a
+-- readable name from the registry id: strip ANY namespace (everything up to
+-- and including the last ':'), swap '_' for spaces, Title Case. True
+-- localization would need a hardcoded table or the commands API (command
+-- computer only) — not worth it here.
+local function niceName(id)
+  if not id then return "" end
+  local short = id:gsub("^.*:", "")      -- strip any namespace
+  short = short:gsub("_", " ")          -- snake_case -> spaces
+  short = short:gsub("%a", function(c)  -- Title Case each word
+    return c:upper()
+  end, 1)
+  -- capitalize after each space too
+  short = short:gsub(" (%a)", function(c) return c:upper() end)
+  return short
+end
+
 -- Tally every mined block by nice name; the live count panel redraws on
 -- every block so counts are always current.
 local function noteBlock(info)
   if not info then return end
-  local short = (info.name or ""):gsub("^minecraft:", "")
-  if short == "" then return end
-  blockLog[short] = (blockLog[short] or 0) + 1
+  local display = niceName(info.name)
+  if display == "" then return end
+  blockLog[display] = (blockLog[display] or 0) + 1
   drawBlockCounts()
 end
 
