@@ -27,7 +27,8 @@
       re-running with the same <w h l> resumes, a different size starts fresh
     - Block logging: every block is inspected before digging; all blocks are
       tallied and reported at the end (ores highlighted live)
-    - Gravel/falling-block re-dig, live status display, chat alerts
+    - Gravel/falling-block re-dig, live status display with live block
+      counts, chat alerts
 
   Alerts: uses a Plethora/Sc-Peripherals `chatBox` if present, else falls
   back to `rednet.broadcast` if a modem is attached, else just prints.
@@ -160,6 +161,27 @@ local function log(msg)
   term.setCursorPos(1, h); term.scroll(1); term.write(msg or "")
 end
 
+-- Live block-count panel: lines 4..(h-1), one block per line, top counts
+-- first. Bottom line (h) stays reserved for log() event messages.
+local function drawBlockCounts()
+  local _, th = term.getSize()
+  local last = th - 1
+  local names = {}
+  for n in pairs(blockLog) do names[#names + 1] = n end
+  table.sort(names, function(a, b)
+    if blockLog[a] ~= blockLog[b] then return blockLog[a] > blockLog[b] end
+    return a < b
+  end)
+  for y = 4, last do term.setCursorPos(1, y); term.clearLine() end
+  local y = 4
+  for _, n in ipairs(names) do
+    if y > last then break end
+    term.setCursorPos(1, y)
+    term.write(("%s x%d"):format(n, blockLog[n]))
+    y = y + 1
+  end
+end
+
 -- --- state persistence ------------------------------------------------
 local function saveState()
   local f = fs.open(STATE_FILE, "w")
@@ -221,20 +243,14 @@ local function refuelFrom(slot, target)
 end
 
 -- --- block logging ----------------------------------------------------
--- ponytail: substring match catches every *_ore and deepslate variant plus
--- ancient_debris; used only to highlight ores in the live log.
-local function isOre(name)
-  return name and (name:find("_ore", 1, true) ~= nil
-                   or name == "minecraft:ancient_debris")
-end
-
--- Tally every mined block by nice name; ores also get a live log line.
+-- Tally every mined block by nice name; the live count panel redraws on
+-- every block so counts are always current.
 local function noteBlock(info)
   if not info then return end
   local short = (info.name or ""):gsub("^minecraft:", "")
   if short == "" then return end
   blockLog[short] = (blockLog[short] or 0) + 1
-  if isOre(info.name) then log(("ore: %s"):format(short)) end
+  drawBlockCounts()
 end
 
 -- --- falling-block-safe dig/move helpers ------------------------------
