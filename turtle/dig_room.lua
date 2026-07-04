@@ -401,20 +401,34 @@ local function ensureChestAhead()
 end
 
 local function dropLootAtHome()
-  turnTo({ x = 0, z = -1 })
-  ensureChestAhead()
-  local groundFallback = false
+  -- Prefer placing chests at the entrance (-z); fall back to the room interior
+  -- (+z), which is guaranteed carved air with a solid floor. The entrance cell
+  -- is often solid if the turtle wasn't placed at a pre-dug tunnel mouth.
+  local chestDirs = { { x = 0, z = -1 }, { x = 0, z = 1 } }
+  local chestDir  = chestDirs[1]
+  local placed    = false
+  for _, d in ipairs(chestDirs) do
+    turnTo(d)
+    if ensureChestAhead() then chestDir = d; placed = true; break end
+  end
+  local groundFallback = not placed
+  if groundFallback then
+    notify("WARN", "Could not place a chest (slot 2 empty or blocked both ways). " ..
+           "Dumping loot into the room.")
+  end
+
   for s = 3, 16 do
     if turtle.getItemCount(s) > 0 then
       turtle.select(s)
       if groundFallback then
-        turnTo({ x = 0, z = 1 }); turtle.drop(); turnTo({ x = 0, z = -1 })
+        -- face into the room (+z, carved air) and dump on the ground
+        turnTo({ x = 0, z = 1 }); turtle.drop(); turnTo(chestDir)
       else
         while turtle.getItemCount(s) > 0 do
           if turtle.drop() then
-            -- slot emptied
+            -- slot emptied into the chest
           else
-            -- chest full (or no chest): chain a new one or fall back
+            -- chest full: chain a new one along +x (perpendicular to chestDir)
             if turtle.getItemCount(CHEST_SLOT) == 0 then
               notify("WARN", "Ran out of chests! Dumping remaining loot on the ground.")
               groundFallback = true
@@ -422,7 +436,7 @@ local function dropLootAtHome()
             end
             turnTo({ x = 1, z = 0 })
             if not step() then break end
-            turnTo({ x = 0, z = -1 })
+            turnTo(chestDir)
             if not ensureChestAhead() then groundFallback = true; break end
           end
         end
