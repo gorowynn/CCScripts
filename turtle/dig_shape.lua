@@ -443,7 +443,9 @@ local function ensureChestAhead()
     if ok and info and info.name == "minecraft:chest" then return true end
     return false
   end
-  if turtle.getItemCount(CHEST_SLOT) == 0 then return false end
+  -- only place if slot 2 genuinely holds a chest (not whatever's there)
+  local item = turtle.getItemDetail(CHEST_SLOT)
+  if not item or item.name ~= "minecraft:chest" then return false end
   turtle.select(CHEST_SLOT)
   if turtle.place() then
     chestsUsed = chestsUsed + 1
@@ -457,48 +459,60 @@ end
 
 -- Assumes turtle is at (0,0,0). Tries to place/reuse a chest facing the
 -- entrance (-z) first; falls back to the interior (+z). Chains along +x.
+-- If NO chest can be placed (slot 2 empty / blocked both ways), PAUSES for a
+-- keypress and retries — never dumps loot on the ground.
 -- Leaves the turtle back at (0,0,0) facing +z.
+local function waitForChest()
+  -- Loop until a chest is placed/reused ahead. Tries -z then +z each round.
+  while true do
+    for _, d in ipairs({ { x = 0, z = -1 }, { x = 0, z = 1 } }) do
+      turnTo(d)
+      if ensureChestAhead() then return d end
+    end
+    notify("CHEST", "Can't place a chest. Put one in slot 2 and clear the cell " ..
+           "ahead (-z or +z), then press any key.")
+    setStatus("WAITING FOR CHEST — add to slot 2, then press a key...")
+    os.pullEvent("key")
+  end
+end
+
 local function dropLootAtHome()
-  local chestDirs = { { x = 0, z = -1 }, { x = 0, z = 1 } }
-  local chestDir  = chestDirs[1]
-  local placed    = false
-  for _, d in ipairs(chestDirs) do
-    turnTo(d)
-    if ensureChestAhead() then chestDir = d; placed = true; break end
-  end
-  local groundFallback = not placed
-  if groundFallback then
-    notify("WARN", "Could not place a chest (slot 2 empty or blocked both ways). " ..
-           "Dumping loot into the room.")
-  end
+  local chestDir = waitForChest()
   for s = 3, 16 do
     -- keep filler-type items in inventory for pit-filling; don't offload them
     if fillerName then
       local item = turtle.getItemDetail(s)
       if item and item.name == fillerName then
-        -- skip: retained as filler stock
-      elseif turtle.getItemCount(s) > 0 then
-        goto drop
+        goto nextslot
       end
-      goto nextslot
     end
-    ::drop::
     if turtle.getItemCount(s) > 0 then
       turtle.select(s)
-      if groundFallback then
-        turnTo({ x = 0, z = 1 }); turtle.drop(); turnTo(chestDir)
-      else
-        while turtle.getItemCount(s) > 0 do
-          if turtle.drop() then
-          else
-            if turtle.getItemCount(CHEST_SLOT) == 0 then
-              notify("WARN", "Ran out of chests! Dumping remaining loot on the ground.")
-              groundFallback = true; break
+      while turtle.getItemCount(s) > 0 do
+        turnTo(chestDir)
+        if turtle.drop() then
+          -- slot emptied into the chest
+        else
+          -- chest full (or blocked): chain a new one along +x, or wait if none
+          local chained = false
+          while turtle.getItemCount(s) > 0 do
+            local item2 = turtle.getItemDetail(CHEST_SLOT)
+            if not item2 or item2.name ~= "minecraft:chest" then
+              notify("CHEST", "Out of chests! Add more to slot 2, then press any key.")
+              setStatus("OUT OF CHESTS — add to slot 2, then press a key...")
+              os.pullEvent("key")
+            else
+              turnTo({ x = 1, z = 0 })
+              if not step() then break end
+              turnTo(chestDir)
+              if ensureChestAhead() then chained = true; break end
             end
-            turnTo({ x = 1, z = 0 })
-            if not step() then break end
-            turnTo(chestDir)
-            if not ensureChestAhead() then groundFallback = true; break end
+          end
+          if not chained and turtle.getItemCount(s) > 0 then
+            -- step failed or placement blocked: wait for the user to resolve
+            notify("CHEST", "Can't chain a chest. Clear/+place space, then press any key.")
+            setStatus("WAITING FOR CHEST — then press a key...")
+            os.pullEvent("key")
           end
         end
       end
@@ -858,6 +872,11 @@ local function fuelNeeded()
 end
 
 refuelFrom(FUEL_SLOT)   -- greedy: burn everything in the dedicated fuel slot
+-- note slot 2 chest status at startup (loot offload will pause if missing)
+local slot2 = turtle.getItemDetail(CHEST_SLOT)
+if not slot2 or slot2.name ~= "minecraft:chest" then
+  notify("INFO", "No chest in slot 2 — loot offload will pause and wait when needed.")
+end
 -- hill fill mode: if slot 3 holds a block on startup, use it as the filler
 -- type and pull matching blocks from anywhere in the inventory when filling pits.
 if mode == "hill" then
