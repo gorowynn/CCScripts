@@ -289,15 +289,14 @@ local function tryResume()
   -- opt-in: never silently resume. Ask the user first.
   local dc = data.doneColumns or 0
   print(("Found in-progress %s job: %d/%d columns done."):format(mode, dc, totalColumns))
+  print("Place the turtle back at the ORIGINAL start corner, facing the")
+  print("ORIGINAL start direction, then answer 'y'.")
   io.write("Resume it? [y/N]: ")
   local s = io.read()
   if not s or s:sub(1,1):lower() ~= "y" then return false end   -- start fresh
-  -- Trust the saved pos/heading. CC:T turtles do NOT move or rotate when
-  -- powered off / rebooted, so after a restart the turtle is physically still
-  -- at the saved position facing the saved way. Resetting to (0,0,0) would
-  -- desync tracked pos from physical pos and carve the wrong columns.
-  pos, heading     = data.pos or { x = 0, y = 0, z = 0 },
-                     data.heading or { x = 0, z = 1 }
+  -- RE-ANCHOR: assume the user re-placed the turtle at the home corner.
+  -- The dig loop navigates via goTo to the saved cursor before continuing.
+  pos, heading     = { x = 0, y = 0, z = 0 }, { x = 0, z = 1 }
   w, l, lengthDir  = data.w or 0, data.l or 0, data.lengthDir or 1
   goingUp          = data.goingUp
   if goingUp == nil then goingUp = true end
@@ -579,9 +578,14 @@ local function fuelNeededRoom()
 end
 
 local function digRoom()
-  -- pos/heading are restored from state on resume; the turtle is physically
-  -- still at the saved cell (CC:T turtles don't move when powered off), so the
-  -- loop can continue in place without re-navigating.
+  -- Re-anchor resume: navigate from the home corner (0,0,0) to the saved
+  -- cursor (w, l) before continuing. The turtle must be physically placed
+  -- back at the home corner facing the original start direction.
+  if doneColumns > 0 and not (w == 0 and l == 0) then
+    setStatus(("Resuming: navigating to W%d L%d..."):format(w + 1, l + 1))
+    if not goTo(w, 0, l) then return end
+    turnTo({ x = 0, z = lengthDir })
+  end
   while w < WIDTH do
     if aborting then break end
     turnTo({ x = 0, z = lengthDir })
