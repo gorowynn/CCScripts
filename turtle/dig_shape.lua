@@ -564,16 +564,52 @@ local function pkey(x, z) return x .. "," .. z end
 
 local function smoothstep(t) return t * t * (3 - 2 * t) end
 
--- Probe the ground height at the current (x,z): descend through AIR (no dig)
--- until solid below, return the air-cell height above it, restore position.
--- ponytail: survey must not modify terrain, so never digs. If the turtle is
--- below the surface (in a hole), it can't see up; rare for surface smoothing.
+-- Is the block `name` solid ground for height purposes? Fluff sitting on top
+-- of real ground (grass, crops, leaves, water, snow layers, flowers, vines)
+-- is NOT counted — we descend through it to find the real surface.
+-- ponytail: substring blacklist catches every vanilla variant + most modded
+-- foliage/liquid without a curated list. Unknown blocks are treated as solid
+-- (conservative — better to stop than to dig indefinitely).
+local function isGroundSolid(name)
+  if not name then return true end
+  local n = name:gsub("^.*:", "")
+  if n == "water" or n == "lava" then return false end
+  if n == "air" then return false end
+  if n:find("leaves", 1, true) then return false end
+  if n:find("grass", 1, true) and n ~= "grass_block" and n ~= "dirt_path" then return false end
+  if n:find("_sapling", 1, true) then return false end
+  if n == "wheat" or n == "carrots" or n == "potatoes" or n == "beetroots"
+     or n:find("_stem", 1, true) or n:find("crop", 1, true) then return false end
+  if n:find("flower", 1, true) or n == "dandelion" or n == "poppy"
+     or n == "cornflower" or n:find("tulip", 1, true)
+     or n:find("lily", 1, true) or n == "dead_bush" or n:find("fern", 1, true) then return false end
+  if n:find("vine", 1, true) or n == "ladder" then return false end
+  if n == "snow" or n:find("snow_layer", 1, true) then return false end
+  if n:find("seagrass", 1, true) or n:find("kelp", 1, true) then return false end
+  if n:find("mushroom", 1, true) then return false end
+  return true
+end
+
+-- Probe the ground height at the current (x,z): descend through AIR and
+-- non-solid fluff (no dig — move through them) until a SOLID block is below,
+-- return that air-cell height, restore position. survey must not modify
+-- terrain, so it never digs; if a non-solid block can't be moved through
+-- (e.g. some modded foliage), probing gives up at that height.
 local function probeGround()
   local drops = 0
-  while not turtle.detectDown() and drops < 256 do
-    if not turtle.down() then break end
-    pos.y = pos.y - 1
-    drops = drops + 1
+  while drops < 256 do
+    local detected = turtle.detectDown()
+    if not detected then
+      if not turtle.down() then break end
+      pos.y = pos.y - 1; drops = drops + 1
+    else
+      local ok, info = turtle.inspectDown()
+      if not ok then break end
+      if isGroundSolid(info.name) then break end   -- real ground reached
+      -- non-solid fluff: try to descend through it without mining
+      if not turtle.down() then break end
+      pos.y = pos.y - 1; drops = drops + 1
+    end
   end
   local groundY = pos.y
   for _ = 1, drops do
