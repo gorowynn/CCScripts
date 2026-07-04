@@ -179,6 +179,14 @@ local aborting     = false
 local chestsUsed   = 0
 local blockLog     = {}         -- block name (no namespace) -> count
 
+-- ponytail: terminal width is tiny (39x13 on a stock turtle). Cache it once;
+-- CC:T doesn't support terminal resize, so this is safe.
+local TW = select(1, term.getSize()) or 39
+local function trunc(s, w)
+  w = w or TW
+  return #s <= w and s or s:sub(1, w)
+end
+
 -- --- live status display ----------------------------------------------
 -- Format seconds into a short human-ish duration (e.g. "2m 13s", "1h 4m").
 local function fmtTime(s)
@@ -189,27 +197,27 @@ local function fmtTime(s)
 end
 
 local function setStatus(msg)
-  term.setCursorPos(1, 1); term.clearLine(); term.write(msg or "")
+  term.setCursorPos(1, 1); term.clearLine(); term.write(trunc(msg or ""))
   term.setCursorPos(1, 2); term.clearLine()
   local done, total
   if mode == "hill" then done, total = doneLayers, totalLayers
   else                  done, total = doneColumns, totalColumns end
-  term.write(("Progress: %d / %d  (%d%%)"):format(
-        done, total, math.floor(done / total * 100)))
+  term.write(trunc(("Progress: %d / %d  (%d%%)"):format(
+        done, total, math.floor(done / total * 100))))
   -- ETA: average process-time per unit so far * remaining.
   -- ponytail: os.clock() is CPU time, excludes sleep/idle (e.g. fuel pause),
-  -- so ETA skews low during waits — acceptable on a small terminal where we
-  -- can't fit a wall-clock row too.
+  -- so ETA skews low during waits — acceptable on a small terminal.
   term.setCursorPos(1, 3); term.clearLine()
   local elapsed = os.clock() - startTime
   local eta = (done > 0) and (elapsed / done) * (total - done) or nil
-  local etaStr = eta and ("  ETA %s"):format(fmtTime(eta)) or ""
-  term.write(("Fuel: %s%s"):format(tostring(turtle.getFuelLevel()), etaStr))
+  local etaStr = eta and (" ETA %s"):format(fmtTime(eta)) or ""
+  -- Fuel number can be huge; truncate the whole line to terminal width.
+  term.write(trunc(("Fuel: %s%s"):format(tostring(turtle.getFuelLevel()), etaStr)))
 end
 
 local function log(msg)
   local _, h = term.getSize()
-  term.setCursorPos(1, h); term.scroll(1); term.write(msg or "")
+  term.setCursorPos(1, h); term.scroll(1); term.write(trunc(msg or ""))
 end
 
 -- Live block-count panel: lines 4..(h-1), one block per line, top counts
@@ -228,7 +236,12 @@ local function drawBlockCounts()
   for _, n in ipairs(names) do
     if y > last then break end
     term.setCursorPos(1, y)
-    term.write(("%s x%d"):format(n, blockLog[n]))
+    -- ponytail: "name xNNNN" must fit terminal width; truncate the NAME
+    -- (right-trim with ellipsis if needed), keep the count visible.
+    local suffix = (" x%d"):format(blockLog[n])
+    local maxName = TW - #suffix
+    local display = (#n <= maxName) and n or (n:sub(1, maxName - 1) .. "~")
+    term.write(display .. suffix)
     y = y + 1
   end
 end
