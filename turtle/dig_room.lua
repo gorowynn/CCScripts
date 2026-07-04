@@ -34,25 +34,73 @@
   back to `rednet.broadcast` if a modem is attached, else just prints.
 
   Usage:  dig_room <width> <height> <length>
---]]
+          dig_room                         -- interactive: prompts for shape + dims
+--]]]
 
 local args = { ... }
-if #args < 3 then
-  print("Usage: dig_room <width> <height> <length>")
-  print("  width  = blocks across (left/right)")
-  print("  height = blocks up (1 ok; 1x1x1 rejected)")
-  print("  length = blocks forward (face this way at start)")
-  return
+-- --- argument parsing: CLI if given, else interactive guided prompts -----
+local WIDTH, HEIGHT, LENGTH
+
+local function readNumber(prompt)
+  while true do
+    io.write(prompt)
+    local s = io.read()
+    if not s then return nil end   -- EOF / Ctrl-D
+    s = s:gsub("^%s+", ""):gsub("%s+$", "")
+    if s == "" then
+      print("  (enter a number)")
+    else
+      local n = tonumber(s)
+      if n and n == math.floor(n) and n >= 1 then return n end
+      print("  must be a positive integer")
+    end
+  end
 end
 
-local WIDTH  = tonumber(args[1])
-local HEIGHT = tonumber(args[2])
-local LENGTH = tonumber(args[3])
-if not (WIDTH and HEIGHT and LENGTH)
-   or WIDTH < 1 or HEIGHT < 1 or LENGTH < 1 then
-  printError("width, height and length must be positive integers")
-  return
+local function readChoice(prompt, options)
+  while true do
+    print(prompt)
+    for i, opt in ipairs(options) do
+      print(("  %d) %s"):format(i, opt.label))
+    end
+    io.write("Choice [1-" .. #options .. "]: ")
+    local s = io.read()
+    if not s then return nil end
+    local n = tonumber(s:gsub("^%s+", ""):gsub("%s+$", ""))
+    if n and n >= 1 and n <= #options then return options[n].value end
+    print("  invalid choice")
+  end
 end
+
+if #args >= 3 then
+  WIDTH  = tonumber(args[1])
+  HEIGHT = tonumber(args[2])
+  LENGTH = tonumber(args[3])
+  if not (WIDTH and HEIGHT and LENGTH)
+     or WIDTH < 1 or HEIGHT < 1 or LENGTH < 1 then
+    printError("width, height and length must be positive integers")
+    return
+  end
+else
+  -- guided mode
+  term.clear(); term.setCursorPos(1, 1)
+  print("=== dig_room guided setup ===")
+  print("")
+  local shape = readChoice("Mine which shape?", {
+    { label = "rectangular room", value = "room" },
+    -- add more shapes here when implemented
+  })
+  if shape ~= "room" then
+    printError("only 'room' is implemented so far.")
+    return
+  end
+  print("")
+  WIDTH  = readNumber("Width  (blocks across, left/right):  ")
+  LENGTH = readNumber("Length (blocks forward, face this way): ")
+  HEIGHT = readNumber("Height (blocks up, 1 ok):            ")
+  if not (WIDTH and HEIGHT and LENGTH) then return end   -- user bailed (EOF)
+end
+
 if WIDTH * HEIGHT * LENGTH < 2 then
   -- only 1x1x1 reaches here: the turtle already occupies the sole cell
   printError("1x1x1 has nothing to dig (the turtle is already in the only cell).")
