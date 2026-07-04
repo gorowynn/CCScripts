@@ -586,24 +586,41 @@ local function digRoom()
 end
 
 -- === HILL =============================================================
--- ponytail: cheap deterministic hash -> {-1, 0, +1}; reproducible across
--- resume (no RNG seed to persist). Gives the ramp a natural rough surface
--- instead of a sterile diagonal. No bit ops (Lua 5.1/CC:T safe).
-local function surfaceJitter(x, li)
-  local h = (x * 73856093 + li * 19349663) % 2147483647
-  h = math.floor(h / 715827883) % 3
-  return h - 1   -- -1, 0, or +1
+-- Per-column peak height via value noise. The ridge line (high edge)
+-- undulates across the width so the hill looks naturally rough — goes up
+-- AND down — instead of a sterile diagonal that only builds up.
+-- ponytail: each column rises monotonically 0 -> colPeak(x). Dips ALONG the
+-- slope (non-monotonic in li) would leave solid walls mid-room that trap the
+-- turtle under the layer-carve model, so the variation lives across the
+-- width. No bit ops (Lua 5.1/CC:T safe); deterministic, resume-safe.
+local PEAK_AMP = math.max(1, math.floor((HIGH or 0) / 3))   -- relief in blocks
+
+local function colPeak(x)
+  if WIDTH <= 1 then return HIGH end
+  local spacing = 2
+  local i0 = math.floor(x / spacing) * spacing
+  local i1 = i0 + spacing
+  local function cp(ix)
+    local h = ((ix + 101) * 73856093) % 2147483647
+    return (HIGH - PEAK_AMP) + (h % (2 * PEAK_AMP + 1))   -- [HIGH-amp, HIGH+amp]
+  end
+  if i1 > WIDTH - 1 then return cp(i0) end
+  local v0, v1 = cp(i0), cp(i1)
+  local t = (x - i0) / spacing
+  return math.floor(v0 + (v1 - v0) * t + 0.5)
 end
 
--- Ramp surface height at cell (x, l). Linear rise 0 -> HIGH, jittered ±1,
--- clamped to [0, HIGH].
+-- Highest peak across all columns; hill layers run 1..maxPeak.
+local maxPeak = HIGH or 0
+if mode == "hill" then
+  for x = 0, WIDTH - 1 do maxPeak = math.max(maxPeak, colPeak(x)) end
+  totalLayers = maxPeak
+end
+
+-- Ramp surface height at cell (x, li): rises 0 -> colPeak(x) along the slope.
 local function hillSurface(x, li)
-  if LENGTH <= 1 then return HIGH end
-  local base = math.floor(HIGH * li / (LENGTH - 1) + 0.5)
-  local s = base + surfaceJitter(x, li)
-  if s < 0 then s = 0 end
-  if s > HIGH then s = HIGH end
-  return s
+  if LENGTH <= 1 then return colPeak(x) end
+  return math.floor(colPeak(x) * li / (LENGTH - 1) + 0.5)
 end
 
 -- Largest length-index (inclusive) whose surface at column x is below layer y.
@@ -633,19 +650,19 @@ end
 
 local function fuelNeededHill()
   local cells = 0
-  for y = 1, HIGH do
+  for y = 1, maxPeak do
     for x = 0, WIDTH - 1 do
       cells = cells + (hillLMax(x, y) + 1)
     end
   end
-  local ascend = HIGH
-  local goHome = WIDTH + LENGTH + HIGH   -- worst-case reposition/return
+  local ascend  = maxPeak
+  local goHome  = WIDTH + LENGTH + maxPeak   -- worst-case reposition/return
   return cells + ascend + goHome
 end
 
 local function digHill()
   -- ascend to the top layer at the low-edge corner (digs through any material)
-  for _ = 1, HIGH do
+  for _ = 1, maxPeak do
     if not safeUp() then return end
     pos.y = pos.y + 1
   end
@@ -702,7 +719,7 @@ if not tryResume() then
   clearState()   -- discard any stale state from a different job
   pos, heading   = { x = 0, y = 0, z = 0 }, { x = 0, z = 1 }
   w, l, lengthDir, goingUp = 0, 0, 1, true
-  hillY, doneLayers = HIGH or 0, 0
+  hillY, doneLayers = maxPeak, 0
   doneColumns, aborting, chestsUsed, blockLog = 0, false, 0, {}
 end
 saveState()
