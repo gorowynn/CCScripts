@@ -6,9 +6,12 @@
     HEIGHT = blocks up       (1 is fine; 1x1x1 is rejected — nothing to dig)
     LENGTH = blocks forward  (face this way at start)
 
-  Pattern: column-by-column. At each floor cell the turtle sweeps a 1x1
-  vertical shaft up through HEIGHT, returns to the floor, then steps to the
-  next cell in a boustrophedon (snake) path across the W x L floor.
+  Pattern: vertical wave (boustrophedon in the vertical plane). The turtle
+  mines a 1x1 shaft UP through HEIGHT at the first floor cell, steps sideways
+  at the TOP to the next cell, mines DOWN, steps sideways at the FLOOR, mines
+  UP, and so on. Every block is mined with exactly one move into it — no
+  wasted descent. Across the W x L floor the path also snakes (length
+  direction reverses each width row).
 
   Inventory:
     slot 1 = FUEL  (never dropped as loot)
@@ -99,11 +102,12 @@ local function log(msg)
 end
 
 -- --- run state (all resumable) ----------------------------------------
-local pos         = { x = 0, z = 0 }
+local pos         = { x = 0, y = 0, z = 0 }
 local heading     = { x = 0, z = 1 }
 local w           = 0          -- current width index  [0..WIDTH-1]
 local l           = 0          -- current length index [0..LENGTH-1]
 local lengthDir   = 1          -- +1 or -1 (snake direction along z)
+local goingUp     = true       -- vertical direction of the current column
 local doneColumns = 0
 local aborting    = false
 local chestsUsed  = 0
@@ -120,6 +124,7 @@ local function saveState()
     w            = w,
     l            = l,
     lengthDir    = lengthDir,
+    goingUp      = goingUp,
     doneColumns  = doneColumns,
     aborting     = aborting,
     chestsUsed   = chestsUsed,
@@ -146,6 +151,8 @@ local function tryResume()
   end
   pos, heading     = data.pos, data.heading
   w, l, lengthDir  = data.w, data.l, data.lengthDir
+  goingUp          = data.goingUp
+  if goingUp == nil then goingUp = true end
   doneColumns      = data.doneColumns or 0
   aborting         = data.aborting or false
   chestsUsed       = data.chestsUsed or 0
@@ -153,17 +160,6 @@ local function tryResume()
   notify("RESUME", ("Resuming at W%d L%d (%d/%d columns)")
          :format(w + 1, l + 1, doneColumns, totalColumns))
   return true
-end
-
--- On resume, walk down through already-carved air until solid floor, without
--- digging. At a column boundary detectDown() is immediately true (no move);
--- a mid-column reboot is recovered by descending to the floor.
-local function descendToFloor()
-  local guard = 0
-  while not turtle.detectDown() and guard < HEIGHT do
-    if not turtle.down() then break end
-    guard = guard + 1
-  end
 end
 
 -- --- fuel -------------------------------------------------------------
@@ -294,32 +290,44 @@ local function step()
   return true
 end
 
--- Navigate to a floor cell (tx, tz). Path is carved air, so no digging
--- expected. Returns false (and sets aborting) if blocked.
-local function goTo(tx, tz)
+-- Navigate to a cell (tx, ty, tz) through carved air. Returns false (and
+-- sets aborting) if blocked. Vertical legs use safeUp/safeDown.
+local function goTo(tx, ty, tz)
   if pos.x < tx then turnTo({ x = 1, z = 0 })
   elseif pos.x > tx then turnTo({ x = -1, z = 0 }) end
   while pos.x ~= tx do if not step() then return false end end
   if pos.z < tz then turnTo({ x = 0, z = 1 })
   elseif pos.z > tz then turnTo({ x = 0, z = -1 }) end
   while pos.z ~= tz do if not step() then return false end end
+  while pos.y < ty do if not safeUp() then return false end; pos.y = pos.y + 1 end
+  while pos.y > ty do if not safeDown() then return false end; pos.y = pos.y - 1 end
   return true
 end
 
--- --- the room ----------------------------------------------------------
-local function sweepColumn()
-  for _ = 2, HEIGHT do if not safeUp() then return false end end
-  for _ = 2, HEIGHT do if not safeDown() then return false end end
+-- --- the room (vertical wave / boustrophedon) -------------------------
+-- Mine one column in the given vertical direction. Returns false on stuck.
+-- For HEIGHT==1 this is a no-op (the cell is already air under the turtle).
+local function mineColumn(up)
+  if up then
+    for _ = 2, HEIGHT do
+      if not safeUp() then return false end
+      pos.y = pos.y + 1
+    end
+  else
+    for _ = 2, HEIGHT do
+      if not safeDown() then return false end
+      pos.y = pos.y - 1
+    end
+  end
   return true
 end
 
 local function fuelNeeded()
   local columns   = WIDTH * LENGTH
-  local vertical  = columns * 2 * (HEIGHT - 1)
-  local lengthFwd = WIDTH * (LENGTH - 1)
-  local sideSteps = WIDTH - 1
-  local goHome    = (WIDTH - 1) + (LENGTH - 1)
-  return vertical + lengthFwd + sideSteps + goHome
+  local vertical  = columns * (HEIGHT - 1)   -- one pass per column, not up+down
+  local horizontal = columns - 1             -- stepping between columns
+  local goHome    = (WIDTH - 1) + (LENGTH - 1) + (HEIGHT - 1)  -- worst case
+  return vertical + horizontal + goHome
 end
 
 -- --- loot drop (reused by mid-dig offload and final drop) -------------
@@ -408,11 +416,9 @@ end
 -- start or resume
 if not tryResume() then
   clearState()   -- discard any stale state from a different job
-  pos, heading   = { x = 0, z = 0 }, { x = 0, z = 1 }
-  w, l, lengthDir = 0, 0, 1
+  pos, heading   = { x = 0, y = 0, z = 0 }, { x = 0, z = 1 }
+  w, l, lengthDir, goingUp = 0, 0, 1, true
   doneColumns, aborting, chestsUsed, oreLog = 0, false, 0, {}
-else
-  descendToFloor()
 end
 saveState()
 
@@ -425,28 +431,30 @@ while w < WIDTH do
 
     -- mid-dig offload when every loot slot is occupied
     if inventoryFull() then
-      local tx, tz = pos.x, pos.z
+      local tx, ty, tz = pos.x, pos.y, pos.z
       setStatus("Inventory full — returning to drop loot...", doneColumns)
       notify("FULL", "Inventory full; returning to start to offload loot.")
-      if goTo(0, 0) then
+      if goTo(0, 0, 0) then
         dropLootAtHome()
-        goTo(tx, tz)
+        goTo(tx, ty, tz)
       end
       turnTo({ x = 0, z = lengthDir })
       saveState()
       if aborting then break end
     end
 
-    setStatus(("Digging column W%d L%d"):format(w + 1, l + 1), doneColumns)
-    if not sweepColumn() then break end
+    setStatus(("Digging column W%d L%d (%s)"):format(
+          w + 1, l + 1, goingUp and "up" or "down"), doneColumns)
+    if not mineColumn(goingUp) then break end
     doneColumns = doneColumns + 1
+    goingUp = not goingUp    -- reverse vertical direction for the next column
 
     l = l + 1
     if l < LENGTH then
       setStatus(("Moving to L%d"):format(l + 1), doneColumns)
       if not step() then break end
     end
-    saveState()   -- invariant: saved (w,l) = next column to dig
+    saveState()   -- invariant: saved (w,l,goingUp) = next column to dig
   end
   if aborting then break end
 
@@ -468,7 +476,7 @@ if aborting then
 else
   setStatus("Returning to start...", doneColumns)
 end
-goTo(0, 0)
+goTo(0, 0, 0)
 turnTo({ x = 0, z = -1 })   -- face the entrance (-z) for the final drop
 
 -- --- drop loot ---------------------------------------------------------
