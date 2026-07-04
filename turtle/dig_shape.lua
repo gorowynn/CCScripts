@@ -611,6 +611,28 @@ local function pkey(x, z) return x .. "," .. z end
 
 local function smoothstep(t) return t * t * (3 - 2 * t) end
 
+-- --- Geo Scanner (Advanced Peripherals 0.7.x) ------------------------
+-- AP exposes the scanner as a turtle upgrade; the call surface is either
+-- `turtle.scan(r)` or via peripheral.wrap on the upgrade's side. Probe both.
+-- Returns the scanner table (with .scan) or nil. ponytail: AP 0.7 docs only
+-- document the peripheral form; the turtle-upgrade wrapping is undocumented,
+-- so we sniff at runtime instead of guessing a side.
+local geoScanner = nil
+local function detectGeoScanner()
+  if type(turtle.scan) == "function" then
+    return { scan = function(r) return turtle.scan(r) end,
+             fuel  = function() return (turtle.getFuelLevel and turtle.getFuelLevel()) or 0 end,
+             maxFuel = function() return (turtle.getMaxFuelLevel and turtle.getMaxFuelLevel()) or 0 end }
+  end
+  for _, side in ipairs({ "left", "right", "top", "bottom", "front", "back" }) do
+    if peripheral.isPresent(side) and peripheral.hasType(side, "geoScanner") then
+      local p = peripheral.wrap(side)
+      if p and type(p.scan) == "function" then return p end
+    end
+  end
+  return nil
+end
+
 -- Is the block `name` solid ground for height purposes? Fluff sitting on top
 -- of real ground (grass, crops, leaves, water, snow layers, flowers, vines)
 -- is NOT counted — we descend through it to find the real surface.
@@ -824,9 +846,65 @@ local function fuelNeededHill()
   return survey + carve + goHome
 end
 
+-- Scan-survey: one Geo Scanner call from the start corner. Fills
+-- perimeterHeights directly from the returned block table. The scanner
+-- returns block POSITIONS relative to itself, so for each perimeter cell we
+-- look up the highest solid block below the turtle's Y (start ground = 0).
+-- Returns true on success, false if the scanner can't cover the area or fails.
+local function scanSurvey()
+  if not geoScanner then return false end
+  -- perimeter spans x:[-1,W], z:[-1,L]; need radius >= max(W,L)+1
+  local radius = math.max(WIDTH, LENGTH) + 1
+  -- ponytail: AP max radius is 16 by default; bigger rooms need stitching.
+  -- We don't stitch — fall back to walking if it doesn't fit.
+  if radius > 16 then
+    notify("SURVEY", ("Room needs scan radius %d > 16; falling back to walk survey."):format(radius))
+    return false
+  end
+  -- FE check: Geo Scanner costs Forge Energy, not turtle fuel.
+  local maxFuel = (type(geoScanner.getMaxFuelLevel) == "function") and geoScanner.getMaxFuelLevel() or 0
+  local cost    = (type(geoScanner.cost) == "function") and geoScanner.cost(radius) or 0
+  if maxFuel > 0 and cost > maxFuel then
+    notify("SURVEY", ("Geo Scanner needs %d FE, has %d. Charge it or use walk survey."):format(cost, maxFuel))
+    return false
+  end
+  notify("SURVEY", ("Scanning radius %d via Geo Scanner (cost %d FE)..."):format(radius, cost))
+  local blocks, err = geoScanner.scan(radius)
+  if not blocks then
+    notify("SURVEY", "Scan failed: " .. tostring(err) .. ". Falling back to walk.")
+    return false
+  end
+  -- Index blocks by (x,z). Keep the HIGHEST solid block at each column: that's
+  -- the ground surface (scanner sees everything in the cube, including caves
+  -- below — we want the topmost solid).
+  local colHighest = {}   -- [pkey] -> y of topmost solid block
+  for _, b in ipairs(blocks) do
+    if b and b.name and isGroundSolid(b.name) then
+      local k = pkey(b.x, b.z)
+      if colHighest[k] == nil or b.y > colHighest[k] then colHighest[k] = b.y end
+    end
+  end
+  -- Air-cell height = topmost solid y + 1 (turtle stands above the surface).
+  for x = -1, WIDTH do
+    for z = -1, LENGTH do
+      if x == -1 or x == WIDTH or z == -1 or z == LENGTH then
+        local topSolid = colHighest[pkey(x, z)]
+        if topSolid then
+          perimeterHeights[pkey(x, z)] = topSolid + 1
+        end
+      end
+    end
+  end
+  surveyed = true
+  notify("SURVEY", ("Scanned %d blocks; %d perimeter cells measured."):format(#blocks, (function() local n=0 for _ in pairs(perimeterHeights) do n=n+1 end return n end)()))
+  return true
+end
+
 local function digHill()
   if not surveyed then
-    runSurvey()
+    if not scanSurvey() then
+      runSurvey()   -- walk fallback (non-destructive probe of each perimeter cell)
+    end
     surface = buildSurface()
     saveState()
     if aborting then return end
@@ -916,6 +994,15 @@ if not tryResume() then
 end
 -- hill: rebuild surface table from probed heights (or empty if not surveyed)
 if mode == "hill" and surveyed then surface = buildSurface() end
+-- hill: detect Geo Scanner upgrade (Advanced Peripherals). If present and
+-- charged, the survey uses one scan() instead of walking the perimeter.
+if mode == "hill" then
+  geoScanner = detectGeoScanner()
+  if geoScanner then
+    local mf = (type(geoScanner.getMaxFuelLevel) == "function") and geoScanner.getMaxFuelLevel() or "?"
+    notify("SURVEY", ("Geo Scanner detected (FE: %s). Will scan instead of walk."):format(tostring(mf)))
+  end
+end
 saveState()
 
 -- --- main dig dispatch ------------------------------------------------
