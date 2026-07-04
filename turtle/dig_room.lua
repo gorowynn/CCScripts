@@ -111,7 +111,7 @@ local goingUp     = true       -- vertical direction of the current column
 local doneColumns = 0
 local aborting    = false
 local chestsUsed  = 0
-local oreLog      = {}         -- ore name (no namespace) -> count
+local blockLog    = {}         -- block name (no namespace) -> count
 
 -- --- state persistence ------------------------------------------------
 local function saveState()
@@ -128,7 +128,7 @@ local function saveState()
     doneColumns  = doneColumns,
     aborting     = aborting,
     chestsUsed   = chestsUsed,
-    oreLog       = oreLog,
+    blockLog      = blockLog,
   }))
   f.close()
 end
@@ -156,7 +156,7 @@ local function tryResume()
   doneColumns      = data.doneColumns or 0
   aborting         = data.aborting or false
   chestsUsed       = data.chestsUsed or 0
-  oreLog           = data.oreLog or {}
+  blockLog         = data.blockLog or data.oreLog or {}
   notify("RESUME", ("Resuming at W%d L%d (%d/%d columns)")
          :format(w + 1, l + 1, doneColumns, totalColumns))
   return true
@@ -184,21 +184,21 @@ local function refuelAll(target)
   end
 end
 
--- --- ore logging ------------------------------------------------------
+-- --- block logging --------------------------------------------------
 -- ponytail: substring match catches every *_ore and deepslate variant plus
--- ancient_debris; no curated list to maintain.
+-- ancient_debris; used only to highlight ores in the live log.
 local function isOre(name)
   return name and (name:find("_ore", 1, true) ~= nil
                    or name == "minecraft:ancient_debris")
 end
 
-local function noteOre(info)
+-- Tally every mined block by nice name; ores also get a live log line.
+local function noteBlock(info)
   if not info then return end
   local short = (info.name or ""):gsub("^minecraft:", "")
-  if isOre(info.name) then
-    oreLog[short] = (oreLog[short] or 0) + 1
-    log(("ore: %s"):format(short))
-  end
+  if short == "" then return end
+  blockLog[short] = (blockLog[short] or 0) + 1
+  if isOre(info.name) then log(("ore: %s"):format(short)) end
 end
 
 -- --- falling-block-safe dig/move helpers -----------------------------
@@ -207,7 +207,7 @@ local function digUntilClear(detect, dig, inspectFn)
   while detect() and tries < 40 do
     if inspectFn then
       local ok, info = inspectFn()
-      if ok then noteOre(info) end
+      if ok then noteBlock(info) end
     end
     dig(); sleep(0.3); tries = tries + 1
   end
@@ -418,7 +418,7 @@ if not tryResume() then
   clearState()   -- discard any stale state from a different job
   pos, heading   = { x = 0, y = 0, z = 0 }, { x = 0, z = 1 }
   w, l, lengthDir, goingUp = 0, 0, 1, true
-  doneColumns, aborting, chestsUsed, oreLog = 0, false, 0, {}
+  doneColumns, aborting, chestsUsed, blockLog = 0, false, 0, {}
 end
 saveState()
 
@@ -484,16 +484,17 @@ setStatus("Dropping loot...", doneColumns)
 dropLootAtHome()
 
 -- --- final report ------------------------------------------------------
-local oreBits = {}
-for name, count in pairs(oreLog) do
-  oreBits[#oreBits + 1] = ("%s x%d"):format(name, count)
+local blockBits = {}
+for name, count in pairs(blockLog) do
+  blockBits[#blockBits + 1] = ("%s x%d"):format(name, count)
 end
-table.sort(oreBits)
-local oreSummary = (#oreBits > 0) and (" | ores: " .. table.concat(oreBits, ", ")) or ""
+table.sort(blockBits)
+local blockSummary = (#blockBits > 0)
+  and (" | mined: " .. table.concat(blockBits, ", ")) or ""
 
 local summary = ("Done. %d/%d columns, %d chest(s) used.%s%s"):format(
   doneColumns, totalColumns, chestsUsed,
-  aborting and " (ABORTED early)" or "", oreSummary)
+  aborting and " (ABORTED early)" or "", blockSummary)
 setStatus(summary, doneColumns)
 notify("DONE", summary)
 clearState()
