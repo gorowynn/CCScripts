@@ -1,5 +1,7 @@
 --[[
-  dig_room.lua — carve a rectangular room.
+  dig_shape.lua — turtle dig tool. Two modes:
+
+  === ROOM ===  carve a rectangular room.
   Turtle starts at the LOWER-LEFT-FRONT corner, facing the LENGTH direction.
 
     WIDTH  = blocks across  (left/right)
@@ -13,34 +15,54 @@
   wasted descent. Across the W x L floor the path also snakes (length
   direction reverses each width row).
 
-  Inventory:
+  === HILL ===  carve a sloped hillside / ramp (carve only, no placing).
+  Turtle starts at the LOW edge, ground level, facing UPHILL (+z).
+
+    WIDTH  = blocks across  (left/right)
+    LENGTH = slope length   (face this way at start; rises in this direction)
+    HIGH    = total rise    (how many blocks higher the high edge is vs start)
+
+  The ramp surface rises linearly from 0 at the low edge to HIGH at the far
+  edge, plus a small per-cell jitter (±1, deterministic) so the result looks
+  naturally rough rather than a sterile diagonal. The turtle removes every
+  block ABOVE the surface, leaving the ramp. Material at/below the surface
+  is untouched. Existing air is skipped.
+  ponytail: processed layer-by-layer top-down; each layer is a per-column
+  carve length swept in a boustrophedon. Layers shrink as we descend. The
+  jitter makes the high edge ragged rather than straight. Repositioning
+  between layers goes through carved air via goTo — ~40% extra moves vs a
+  perfect variable-height wave, but the wave has off-by-one traps at surface
+  steps whereas layers never put the turtle inside material.
+
+  === Inventory (both modes) ===
     slot 1 = FUEL  only (never dropped as loot, never mined into)
     slot 2 = CHEST (auto-placed; chained into a row when one fills up)
     slots 3-16 = loot. Fuel is ONLY slot 1 — add more there when it empties.
 
-  Extras:
+  Extras (both modes):
     - Pre-flight fuel check + greedy burn of slot 1
     - Inventory-full mid-dig: returns to start, offloads into chests (places/
       chains them, ground-dump fallback if out of chests), then resumes at the
-      exact column it left off
-    - Resume after restart: progress is saved every column to .dig_room_state;
-      re-running with the same <w h l> resumes, a different size starts fresh
+      exact cell it left off
+    - Resume after restart: progress saved to .dig_shape_state each step;
+      re-running with the same dims+mode resumes, else starts fresh
     - Block logging: every block is inspected before digging; all blocks are
-      tallied and reported at the end (ores highlighted live)
+      tallied and reported at the end, shown live
     - Gravel/falling-block re-dig, live status display with live block
       counts, chat alerts
 
   Alerts: uses a Plethora/Sc-Peripherals `chatBox` if present, else falls
   back to `rednet.broadcast` if a modem is attached, else just prints.
 
-  Usage:  dig_room <width> <height> <length>
-          dig_room                         -- interactive: prompts for shape + dims
+  Usage:  dig_shape <width> <height> <length>   -- room mode (CLI)
+          dig_shape                              -- guided: pick shape + dims
 --]]
 
 local args = { ... }
 
 -- --- argument parsing: CLI if given, else interactive guided prompts -----
-local WIDTH, HEIGHT, LENGTH
+local WIDTH, HEIGHT, LENGTH, HIGH
+local mode = "room"   -- "room" or "hill"; CLI defaults to room
 
 local function readNumber(prompt)
   while true do
@@ -75,6 +97,7 @@ local function readChoice(prompt, options)
 end
 
 if #args >= 3 then
+  -- CLI: always room mode
   WIDTH  = tonumber(args[1])
   HEIGHT = tonumber(args[2])
   LENGTH = tonumber(args[3])
@@ -86,34 +109,39 @@ if #args >= 3 then
 else
   -- guided mode
   term.clear(); term.setCursorPos(1, 1)
-  print("=== dig_room guided setup ===")
+  print("=== dig_shape guided setup ===")
   print("")
   local shape = readChoice("Mine which shape?", {
-    { label = "rectangular room", value = "room" },
-    -- add more shapes here when implemented
+    { label = "rectangular room",                value = "room" },
+    { label = "sloped hillside/ramp (carve only)", value = "hill" },
   })
-  if not shape or shape ~= "room" then
-    printError("only 'room' is implemented so far.")
-    return
-  end
+  if not shape then return end   -- EOF
+  mode = shape
   print("")
   WIDTH  = readNumber("Width  (blocks across, left/right):  ")
   LENGTH = readNumber("Length (blocks forward, face this way): ")
-  HEIGHT = readNumber("Height (blocks up, 1 ok):            ")
-  if not (WIDTH and HEIGHT and LENGTH) then return end   -- user bailed (EOF)
-end
-
-if WIDTH * HEIGHT * LENGTH < 2 then
-  -- only 1x1x1 reaches here: the turtle already occupies the sole cell
-  printError("1x1x1 has nothing to dig (the turtle is already in the only cell).")
-  printError("Increase at least one dimension.")
-  return
+  if mode == "hill" then
+    HIGH = readNumber("Rise   (height of high edge above start): ")
+    if not (WIDTH and LENGTH and HIGH) then return end
+    if HIGH < 1 then
+      printError("rise must be a positive integer (use 'room' for a flat dig)")
+      return
+    end
+  else
+    HEIGHT = readNumber("Height (blocks up, 1 ok):            ")
+    if not (WIDTH and HEIGHT and LENGTH) then return end
+    if WIDTH * HEIGHT * LENGTH < 2 then
+      printError("1x1x1 has nothing to dig (the turtle is already in the only cell).")
+      printError("Increase at least one dimension.")
+      return
+    end
+  end
 end
 
 local FUEL_SLOT   = 1
 local CHEST_SLOT  = 2
 local STUCK_LIMIT = 15   -- failed move attempts before declaring stuck
-local STATE_FILE  = ".dig_room_state"
+local STATE_FILE  = ".dig_shape_state"
 
 -- --- chat / log alerts -------------------------------------------------
 local chatBox = peripheral.find("chatBox")
@@ -128,19 +156,24 @@ local function notify(level, msg)
   if chatBox then
     pcall(function() chatBox.say(full) end)   -- Plethora: broadcast nearby
   elseif modem then
-    pcall(function() rednet.broadcast(full, "dig_room") end)
+    pcall(function() rednet.broadcast(full, "dig_shape") end)
   end
 end
 
 -- --- run state (declared early so display/loops close over it) ---------
-local totalColumns = WIDTH * LENGTH
+local totalColumns = WIDTH * LENGTH                  -- room progress total
+local doneColumns  = 0                               -- room progress done
+local totalLayers  = (mode == "hill") and HIGH or 0  -- hill progress total
+local doneLayers   = 0                               -- hill progress done
 local pos          = { x = 0, y = 0, z = 0 }
 local heading      = { x = 0, z = 1 }
+-- room sweep cursors
 local w            = 0          -- current width index  [0..WIDTH-1]
 local l            = 0          -- current length index [0..LENGTH-1]
 local lengthDir    = 1          -- +1 or -1 (snake direction along z)
 local goingUp      = true       -- vertical direction of the current column
-local doneColumns  = 0
+-- hill sweep cursor
+local hillY        = HIGH or 0  -- current layer being carved [HIGH..1]
 local aborting     = false
 local chestsUsed   = 0
 local blockLog     = {}         -- block name (no namespace) -> count
@@ -149,9 +182,15 @@ local blockLog     = {}         -- block name (no namespace) -> count
 local function setStatus(msg)
   term.setCursorPos(1, 1); term.clearLine(); term.write(msg or "")
   term.setCursorPos(1, 2); term.clearLine()
-  term.write(("Progress: %d / %d columns  (%d%%)"):format(
-        doneColumns, totalColumns,
-        math.floor(doneColumns / totalColumns * 100)))
+  if mode == "hill" then
+    term.write(("Progress: %d / %d layers  (%d%%)"):format(
+          doneLayers, totalLayers,
+          math.floor(doneLayers / totalLayers * 100)))
+  else
+    term.write(("Progress: %d / %d columns  (%d%%)"):format(
+          doneColumns, totalColumns,
+          math.floor(doneColumns / totalColumns * 100)))
+  end
   term.setCursorPos(1, 3); term.clearLine()
   term.write(("Fuel: %s   |   loot slots 3-16   |   chests used: see log")
              :format(tostring(turtle.getFuelLevel())))
@@ -188,14 +227,20 @@ local function saveState()
   local f = fs.open(STATE_FILE, "w")
   if not f then return end
   f.write(textutils.serialize({
-    dims         = { WIDTH, HEIGHT, LENGTH },
+    mode         = mode,
+    dims         = { WIDTH, HIGH or HEIGHT, LENGTH },
     pos          = pos,
     heading      = heading,
+    -- room cursors
     w            = w,
     l            = l,
     lengthDir    = lengthDir,
     goingUp      = goingUp,
     doneColumns  = doneColumns,
+    -- hill cursor
+    hillY        = hillY,
+    doneLayers   = doneLayers,
+    -- shared
     aborting     = aborting,
     chestsUsed   = chestsUsed,
     blockLog     = blockLog,
@@ -215,8 +260,9 @@ local function tryResume()
   local ok, data = pcall(textutils.unserialize, f.readAll())
   f.close()
   if not ok or type(data) ~= "table" or not data.dims then return false end
+  if data.mode ~= mode then return false end   -- different mode; start fresh
   local d = data.dims
-  if d[1] ~= WIDTH or d[2] ~= HEIGHT or d[3] ~= LENGTH then
+  if d[1] ~= WIDTH or d[2] ~= (HIGH or HEIGHT) or d[3] ~= LENGTH then
     return false   -- different job; caller will start fresh
   end
   pos, heading     = data.pos, data.heading
@@ -224,11 +270,18 @@ local function tryResume()
   goingUp          = data.goingUp
   if goingUp == nil then goingUp = true end
   doneColumns      = data.doneColumns or 0
+  hillY            = data.hillY or (HIGH or 0)
+  doneLayers       = data.doneLayers or 0
   aborting         = data.aborting or false
   chestsUsed       = data.chestsUsed or 0
   blockLog         = data.blockLog or data.oreLog or {}
-  notify("RESUME", ("Resuming at W%d L%d (%d/%d columns)")
-         :format(w + 1, l + 1, doneColumns, totalColumns))
+  if mode == "hill" then
+    notify("RESUME", ("Resuming hill at layer y=%d (%d/%d layers)")
+           :format(hillY, doneLayers, totalLayers))
+  else
+    notify("RESUME", ("Resuming at W%d L%d (%d/%d columns)")
+           :format(w + 1, l + 1, doneColumns, totalColumns))
+  end
   return true
 end
 
@@ -284,8 +337,7 @@ local function digUntilClear(detect, dig, inspectFn)
 end
 
 -- ponytail: one table-driven mover replaces three near-identical functions.
--- All three directions now share the same out-of-fuel pause-for-key behaviour
--- (forward had it; up/down didn't — inconsistent, now unified).
+-- All three directions share the same out-of-fuel pause-for-key behaviour.
 local MOVERS = {
   forward = { name = "forward", detect = turtle.detect,  dig = turtle.dig,  insp = turtle.inspect,
               move = turtle.forward },
@@ -356,39 +408,7 @@ local function goTo(tx, ty, tz)
   return true
 end
 
--- --- the room (vertical wave / boustrophedon) -------------------------
--- Mine one column in the given vertical direction. Returns false on stuck.
--- For HEIGHT==1 this is a no-op (the cell is already air under the turtle).
-local function mineColumn(up)
-  if up then
-    for _ = 2, HEIGHT do
-      if not safeUp() then return false end
-      pos.y = pos.y + 1
-    end
-  else
-    for _ = 2, HEIGHT do
-      if not safeDown() then return false end
-      pos.y = pos.y - 1
-    end
-  end
-  return true
-end
-
-local function fuelNeeded()
-  local columns    = WIDTH * LENGTH
-  local vertical   = columns * (HEIGHT - 1)   -- one pass per column, not up+down
-  local horizontal = columns - 1              -- stepping between columns
-  local goHome     = (WIDTH - 1) + (LENGTH - 1) + (HEIGHT - 1)  -- worst case
-  return vertical + horizontal + goHome
-end
-
--- --- loot drop (reused by mid-dig offload and final drop) -------------
--- Assumes turtle is at (0,0,0). Tries to place/reuse a chest facing the
--- entrance (-z) first; falls back to the room interior (+z), which is
--- guaranteed carved air with a solid floor. When a chest fills, chains a
--- new one along +x (perpendicular to the facing). If no chest can be placed
--- or slot 2 runs out, dumps loot into the room as a last resort. Leaves the
--- turtle back at (0,0,0) facing +z (into the room).
+-- --- shared loot drop (mid-dig offload and final drop) ----------------
 local function ensureChestAhead()
   if turtle.detect() then
     local ok, info = turtle.inspect()
@@ -407,6 +427,11 @@ local function ensureChestAhead()
   return false
 end
 
+-- Assumes turtle is at (0,0,0). Tries to place/reuse a chest facing the
+-- entrance (-z) first; falls back to the interior (+z), guaranteed carved
+-- air with a solid floor. When a chest fills, chains a new one along +x.
+-- If no chest can be placed or slot 2 runs out, dumps loot as a last resort.
+-- Leaves the turtle back at (0,0,0) facing +z.
 local function dropLootAtHome()
   local chestDirs = { { x = 0, z = -1 }, { x = 0, z = 1 } }
   local chestDir  = chestDirs[1]
@@ -461,7 +486,173 @@ local function inventoryFull()
   return true
 end
 
+-- Offload now: remember where we are, go home, drop, come back. Returns
+-- false if aborted during the trip.
+local function offloadIfFull(returnDir)
+  if not inventoryFull() then return true end
+  local tx, ty, tz = pos.x, pos.y, pos.z
+  setStatus("Inventory full — returning to drop loot...")
+  notify("FULL", "Inventory full; returning to start to offload loot.")
+  if not goTo(0, 0, 0) then return false end
+  dropLootAtHome()
+  goTo(tx, ty, tz)
+  if returnDir then turnTo(returnDir) end
+  return not aborting
+end
+
+-- === ROOM =============================================================
+-- Mine one column in the given vertical direction. Returns false on stuck.
+-- For HEIGHT==1 this is a no-op (the cell is already air under the turtle).
+local function mineColumn(up)
+  if up then
+    for _ = 2, HEIGHT do
+      if not safeUp() then return false end
+      pos.y = pos.y + 1
+    end
+  else
+    for _ = 2, HEIGHT do
+      if not safeDown() then return false end
+      pos.y = pos.y - 1
+    end
+  end
+  return true
+end
+
+local function fuelNeededRoom()
+  local columns    = WIDTH * LENGTH
+  local vertical   = columns * (HEIGHT - 1)
+  local horizontal = columns - 1
+  local goHome     = (WIDTH - 1) + (LENGTH - 1) + (HEIGHT - 1)
+  return vertical + horizontal + goHome
+end
+
+local function digRoom()
+  while w < WIDTH do
+    if aborting then break end
+    turnTo({ x = 0, z = lengthDir })
+    while l < LENGTH do
+      if aborting then break end
+      if not offloadIfFull({ x = 0, z = lengthDir }) then break end
+
+      setStatus(("Digging column W%d L%d (%s)"):format(
+            w + 1, l + 1, goingUp and "up" or "down"))
+      if not mineColumn(goingUp) then break end
+      doneColumns = doneColumns + 1
+      goingUp = not goingUp
+
+      l = l + 1
+      if l < LENGTH then
+        setStatus(("Moving to L%d"):format(l + 1))
+        if not step() then break end
+      end
+      saveState()
+    end
+    if aborting then break end
+
+    l = 0
+    w = w + 1
+    if w < WIDTH then
+      setStatus(("Stepping to width row %d"):format(w + 1))
+      turnTo({ x = 1, z = 0 })
+      if not step() then break end
+      lengthDir = -lengthDir
+      saveState()
+    end
+  end
+end
+
+-- === HILL =============================================================
+-- ponytail: cheap deterministic hash -> {-1, 0, +1}; reproducible across
+-- resume (no RNG seed to persist). Gives the ramp a natural rough surface
+-- instead of a sterile diagonal. No bit ops (Lua 5.1/CC:T safe).
+local function surfaceJitter(x, li)
+  local h = (x * 73856093 + li * 19349663) % 2147483647
+  h = math.floor(h / 715827883) % 3
+  return h - 1   -- -1, 0, or +1
+end
+
+-- Ramp surface height at cell (x, l). Linear rise 0 -> HIGH, jittered ±1,
+-- clamped to [0, HIGH].
+local function hillSurface(x, li)
+  if LENGTH <= 1 then return HIGH end
+  local base = math.floor(HIGH * li / (LENGTH - 1) + 0.5)
+  local s = base + surfaceJitter(x, li)
+  if s < 0 then s = 0 end
+  if s > HIGH then s = HIGH end
+  return s
+end
+
+-- Largest length-index (inclusive) whose surface at column x is below layer y.
+-- Cells [0..lMax] at column x, layer y need carving; beyond is surface/soil.
+local function hillLMax(x, y)
+  local lMax = -1
+  for li = 0, LENGTH - 1 do
+    if hillSurface(x, li) < y then lMax = li end
+  end
+  return lMax
+end
+
+-- Carve column x from z=0..lMax at the current height (pos.y). Returns false
+-- on stuck/abort. The per-column lMax is what gives the high edge its ragged,
+-- natural variation across the width.
+local function sweepColumn(x, lMax, sdir)
+  local target = (sdir == 1) and lMax or 0
+  -- if we're resuming mid-column, the turtle may already be past/short of
+  -- target; the while loop below handles both by walking to target.
+  turnTo({ x = 0, z = sdir })
+  while pos.z ~= target do
+    if not offloadIfFull({ x = 0, z = sdir }) then return false end
+    if not step() then return false end
+  end
+  return true
+end
+
+local function fuelNeededHill()
+  local cells = 0
+  for y = 1, HIGH do
+    for x = 0, WIDTH - 1 do
+      cells = cells + (hillLMax(x, y) + 1)
+    end
+  end
+  local ascend = HIGH
+  local goHome = WIDTH + LENGTH + HIGH   -- worst-case reposition/return
+  return cells + ascend + goHome
+end
+
+local function digHill()
+  -- ascend to the top layer at the low-edge corner (digs through any material)
+  for _ = 1, HIGH do
+    if not safeUp() then return end
+    pos.y = pos.y + 1
+  end
+  while hillY >= 1 do
+    if aborting then break end
+    if not goTo(0, hillY, 0) then break end
+    setStatus(("Carving layer y=%d"):format(hillY))
+    local sdir = 1
+    for col = 0, WIDTH - 1 do
+      if aborting then break end
+      local lMax = hillLMax(col, hillY)
+      if lMax >= 0 then
+        if not sweepColumn(col, lMax, sdir) then break end
+      end
+      if col < WIDTH - 1 then
+        turnTo({ x = 1, z = 0 })
+        if not step() then break end
+        sdir = -sdir
+      end
+    end
+    doneLayers = doneLayers + 1
+    hillY = hillY - 1
+    saveState()
+  end
+end
+
 -- --- pre-flight --------------------------------------------------------
+local function fuelNeeded()
+  return (mode == "hill") and fuelNeededHill() or fuelNeededRoom()
+end
+
 refuelFrom(FUEL_SLOT)   -- greedy: burn everything in the dedicated fuel slot
 do
   local have  = turtle.getFuelLevel()
@@ -473,8 +664,13 @@ do
            :format(need, tostring(have)))
   end
   term.clear()
-  log(("Room %dx%dx%d  (need ~%d fuel, have %s)"):format(
-        WIDTH, HEIGHT, LENGTH, need, tostring(have)))
+  if mode == "hill" then
+    log(("Hill %dx%d rise %d  (need ~%d fuel, have %s)"):format(
+          WIDTH, LENGTH, HIGH, need, tostring(have)))
+  else
+    log(("Room %dx%dx%d  (need ~%d fuel, have %s)"):format(
+          WIDTH, HEIGHT, LENGTH, need, tostring(have)))
+  end
 end
 
 -- start or resume
@@ -482,55 +678,16 @@ if not tryResume() then
   clearState()   -- discard any stale state from a different job
   pos, heading   = { x = 0, y = 0, z = 0 }, { x = 0, z = 1 }
   w, l, lengthDir, goingUp = 0, 0, 1, true
+  hillY, doneLayers = HIGH or 0, 0
   doneColumns, aborting, chestsUsed, blockLog = 0, false, 0, {}
 end
 saveState()
 
--- --- main dig loop ----------------------------------------------------
-while w < WIDTH do
-  if aborting then break end
-  turnTo({ x = 0, z = lengthDir })
-  while l < LENGTH do
-    if aborting then break end
-
-    -- mid-dig offload when every loot slot is occupied
-    if inventoryFull() then
-      local tx, ty, tz = pos.x, pos.y, pos.z
-      setStatus("Inventory full — returning to drop loot...")
-      notify("FULL", "Inventory full; returning to start to offload loot.")
-      if goTo(0, 0, 0) then
-        dropLootAtHome()
-        goTo(tx, ty, tz)
-      end
-      turnTo({ x = 0, z = lengthDir })
-      saveState()
-      if aborting then break end
-    end
-
-    setStatus(("Digging column W%d L%d (%s)"):format(
-          w + 1, l + 1, goingUp and "up" or "down"))
-    if not mineColumn(goingUp) then break end
-    doneColumns = doneColumns + 1
-    goingUp = not goingUp    -- reverse vertical direction for the next column
-
-    l = l + 1
-    if l < LENGTH then
-      setStatus(("Moving to L%d"):format(l + 1))
-      if not step() then break end
-    end
-    saveState()   -- invariant: saved (w,l,goingUp) = next column to dig
-  end
-  if aborting then break end
-
-  l = 0
-  w = w + 1
-  if w < WIDTH then
-    setStatus(("Stepping to width row %d"):format(w + 1))
-    turnTo({ x = 1, z = 0 })
-    if not step() then break end
-    lengthDir = -lengthDir
-    saveState()
-  end
+-- --- main dig dispatch ------------------------------------------------
+if mode == "hill" then
+  digHill()
+else
+  digRoom()
 end
 
 -- --- return to start ---------------------------------------------------
@@ -556,8 +713,11 @@ table.sort(blockBits)
 local blockSummary = (#blockBits > 0)
   and (" | mined: " .. table.concat(blockBits, ", ")) or ""
 
-local summary = ("Done. %d/%d columns, %d chest(s) used.%s%s"):format(
-  doneColumns, totalColumns, chestsUsed,
+local progressWord = (mode == "hill") and "layers" or "columns"
+local doneCount    = (mode == "hill") and doneLayers or doneColumns
+local totalCount   = (mode == "hill") and totalLayers or totalColumns
+local summary = ("Done. %d/%d %s, %d chest(s) used.%s%s"):format(
+  doneCount, totalCount, progressWord, chestsUsed,
   aborting and " (ABORTED early)" or "", blockSummary)
 setStatus(summary)
 notify("DONE", summary)
