@@ -390,7 +390,7 @@ local function inventoryFull()
 end
 
 -- --- pre-flight --------------------------------------------------------
-refuelFrom(FUEL_SLOT)   -- greedy: burn everything in the fuel slot
+refuelAll(math.huge)   -- greedy: burn all fuel in every slot before reporting
 do
   local have  = turtle.getFuelLevel()
   local need  = fuelNeeded()
