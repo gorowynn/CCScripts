@@ -14,20 +14,19 @@
   direction reverses each width row).
 
   Inventory:
-    slot 1 = FUEL  (never dropped as loot)
+    slot 1 = FUEL  only (never dropped as loot, never mined into)
     slot 2 = CHEST (auto-placed; chained into a row when one fills up)
+    slots 3-16 = loot. Fuel is ONLY slot 1 — add more there when it empties.
 
   Extras:
-    - Pre-flight fuel check + refuel from slot 1
-    - Loot-fuel fallback: when slot 1 empties, burn coal/lava/etc. from any
-      loot slot (3-16) before pausing for a manual refuel
+    - Pre-flight fuel check + greedy burn of slot 1
     - Inventory-full mid-dig: returns to start, offloads into chests (places/
       chains them, ground-dump fallback if out of chests), then resumes at the
       exact column it left off
     - Resume after restart: progress is saved every column to .dig_room_state;
       re-running with the same <w h l> resumes, a different size starts fresh
-    - Ore logging: every block is inspected before digging; ores are tallied
-      and reported at the end
+    - Block logging: every block is inspected before digging; all blocks are
+      tallied and reported at the end (ores highlighted live)
     - Gravel/falling-block re-dig, live status display, chat alerts
 
   Alerts: uses a Plethora/Sc-Peripherals `chatBox` if present, else falls
@@ -35,9 +34,10 @@
 
   Usage:  dig_room <width> <height> <length>
           dig_room                         -- interactive: prompts for shape + dims
---]]]
+--]]
 
 local args = { ... }
+
 -- --- argument parsing: CLI if given, else interactive guided prompts -----
 local WIDTH, HEIGHT, LENGTH
 
@@ -90,7 +90,7 @@ else
     { label = "rectangular room", value = "room" },
     -- add more shapes here when implemented
   })
-  if shape ~= "room" then
+  if not shape or shape ~= "room" then
     printError("only 'room' is implemented so far.")
     return
   end
@@ -130,15 +130,26 @@ local function notify(level, msg)
   end
 end
 
--- --- live status display ----------------------------------------------
+-- --- run state (declared early so display/loops close over it) ---------
 local totalColumns = WIDTH * LENGTH
+local pos          = { x = 0, y = 0, z = 0 }
+local heading      = { x = 0, z = 1 }
+local w            = 0          -- current width index  [0..WIDTH-1]
+local l            = 0          -- current length index [0..LENGTH-1]
+local lengthDir    = 1          -- +1 or -1 (snake direction along z)
+local goingUp      = true       -- vertical direction of the current column
+local doneColumns  = 0
+local aborting     = false
+local chestsUsed   = 0
+local blockLog     = {}         -- block name (no namespace) -> count
 
-local function setStatus(msg, done)
+-- --- live status display ----------------------------------------------
+local function setStatus(msg)
   term.setCursorPos(1, 1); term.clearLine(); term.write(msg or "")
   term.setCursorPos(1, 2); term.clearLine()
   term.write(("Progress: %d / %d columns  (%d%%)"):format(
-        done, totalColumns,
-        math.floor(done / totalColumns * 100)))
+        doneColumns, totalColumns,
+        math.floor(doneColumns / totalColumns * 100)))
   term.setCursorPos(1, 3); term.clearLine()
   term.write(("Fuel: %s   |   loot slots 3-16   |   chests used: see log")
              :format(tostring(turtle.getFuelLevel())))
@@ -148,18 +159,6 @@ local function log(msg)
   local _, h = term.getSize()
   term.setCursorPos(1, h); term.scroll(1); term.write(msg or "")
 end
-
--- --- run state (all resumable) ----------------------------------------
-local pos         = { x = 0, y = 0, z = 0 }
-local heading     = { x = 0, z = 1 }
-local w           = 0          -- current width index  [0..WIDTH-1]
-local l           = 0          -- current length index [0..LENGTH-1]
-local lengthDir   = 1          -- +1 or -1 (snake direction along z)
-local goingUp     = true       -- vertical direction of the current column
-local doneColumns = 0
-local aborting    = false
-local chestsUsed  = 0
-local blockLog    = {}         -- block name (no namespace) -> count
 
 -- --- state persistence ------------------------------------------------
 local function saveState()
@@ -176,7 +175,7 @@ local function saveState()
     doneColumns  = doneColumns,
     aborting     = aborting,
     chestsUsed   = chestsUsed,
-    blockLog      = blockLog,
+    blockLog     = blockLog,
   }))
   f.close()
 end
@@ -211,9 +210,8 @@ local function tryResume()
 end
 
 -- --- fuel -------------------------------------------------------------
--- Burn fuel from `slot` until level reaches `target` (default: max) or slot
--- is empty. Greedy by default — pre-flight passes no target so all of slot 1
--- is consumed.
+-- Burn from `slot` until level reaches `target` (default: greedy/all) or the
+-- slot is empty.
 local function refuelFrom(slot, target)
   if turtle.getFuelLevel() == "unlimited" then return end
   target = target or math.huge
@@ -222,17 +220,7 @@ local function refuelFrom(slot, target)
   turtle.select(1)
 end
 
--- Burns slot 1 first, then any fuel in loot slots 3-16. Mid-dig fallback tops
--- up to `target` (default 4000) rather than torching all the loot coal.
-local function refuelAll(target)
-  target = target or 4000
-  refuelFrom(FUEL_SLOT, target)
-  if turtle.getFuelLevel() < target then
-    for s = 3, 16 do refuelFrom(s, target) end
-  end
-end
-
--- --- block logging --------------------------------------------------
+-- --- block logging ----------------------------------------------------
 -- ponytail: substring match catches every *_ore and deepslate variant plus
 -- ancient_debris; used only to highlight ores in the live log.
 local function isOre(name)
@@ -249,7 +237,7 @@ local function noteBlock(info)
   if isOre(info.name) then log(("ore: %s"):format(short)) end
 end
 
--- --- falling-block-safe dig/move helpers -----------------------------
+-- --- falling-block-safe dig/move helpers ------------------------------
 local function digUntilClear(detect, dig, inspectFn)
   local tries = 0
   while detect() and tries < 40 do
@@ -261,24 +249,36 @@ local function digUntilClear(detect, dig, inspectFn)
   end
 end
 
-local function safeForward()
-  digUntilClear(turtle.detect, turtle.dig, turtle.inspect)
+-- ponytail: one table-driven mover replaces three near-identical functions.
+-- All three directions now share the same out-of-fuel pause-for-key behaviour
+-- (forward had it; up/down didn't — inconsistent, now unified).
+local MOVERS = {
+  forward = { name = "forward", detect = turtle.detect,  dig = turtle.dig,  insp = turtle.inspect,
+              move = turtle.forward },
+  up      = { name = "up",      detect = turtle.detectUp, dig = turtle.digUp, insp = turtle.inspectUp,
+              move = turtle.up },
+  down    = { name = "down",    detect = turtle.detectDown, dig = turtle.digDown, insp = turtle.inspectDown,
+              move = turtle.down },
+}
+
+local function safeMove(m)
+  digUntilClear(m.detect, m.dig, m.insp)
   local tries = 0
-  while not turtle.forward() do
+  while not m.move() do
     if turtle.getFuelLevel() == 0 then
-      refuelAll()
+      refuelFrom(FUEL_SLOT)
       if turtle.getFuelLevel() == 0 then
         notify("FUEL", "Out of fuel! Add fuel to slot 1, then press any key.")
-        setStatus("OUT OF FUEL — waiting for refuel...", doneColumns)
+        setStatus("OUT OF FUEL — waiting for refuel...")
         os.pullEvent("key")
-        refuelAll()
+        refuelFrom(FUEL_SLOT)
       end
     end
-    digUntilClear(turtle.detect, turtle.dig, turtle.inspect)
+    digUntilClear(m.detect, m.dig, m.insp)
     sleep(0.2); tries = tries + 1
     if tries >= STUCK_LIMIT then
-      notify("STUCK", "Can't move forward after " .. STUCK_LIMIT ..
-             " tries (unbreakable block?). Aborting dig, returning home.")
+      notify("STUCK", ("Can't move %s after %d tries. Aborting dig, returning home.")
+             :format(m.name, STUCK_LIMIT))
       aborting = true
       return false
     end
@@ -286,39 +286,9 @@ local function safeForward()
   return true
 end
 
-local function safeUp()
-  digUntilClear(turtle.detectUp, turtle.digUp, turtle.inspectUp)
-  local tries = 0
-  while not turtle.up() do
-    if turtle.getFuelLevel() == 0 then refuelAll() end
-    digUntilClear(turtle.detectUp, turtle.digUp, turtle.inspectUp)
-    sleep(0.2); tries = tries + 1
-    if tries >= STUCK_LIMIT then
-      notify("STUCK", "Can't move up after " .. STUCK_LIMIT ..
-             " tries. Aborting dig, returning home.")
-      aborting = true
-      return false
-    end
-  end
-  return true
-end
-
-local function safeDown()
-  digUntilClear(turtle.detectDown, turtle.digDown, turtle.inspectDown)
-  local tries = 0
-  while not turtle.down() do
-    if turtle.getFuelLevel() == 0 then refuelAll() end
-    digUntilClear(turtle.detectDown, turtle.digDown, turtle.inspectDown)
-    sleep(0.2); tries = tries + 1
-    if tries >= STUCK_LIMIT then
-      notify("STUCK", "Can't move down after " .. STUCK_LIMIT ..
-             " tries. Aborting dig, returning home.")
-      aborting = true
-      return false
-    end
-  end
-  return true
-end
+local function safeForward() return safeMove(MOVERS.forward) end
+local function safeUp()      return safeMove(MOVERS.up) end
+local function safeDown()    return safeMove(MOVERS.down) end
 
 -- --- position / heading tracking --------------------------------------
 local function turnRight()
@@ -371,17 +341,20 @@ local function mineColumn(up)
 end
 
 local function fuelNeeded()
-  local columns   = WIDTH * LENGTH
-  local vertical  = columns * (HEIGHT - 1)   -- one pass per column, not up+down
-  local horizontal = columns - 1             -- stepping between columns
-  local goHome    = (WIDTH - 1) + (LENGTH - 1) + (HEIGHT - 1)  -- worst case
+  local columns    = WIDTH * LENGTH
+  local vertical   = columns * (HEIGHT - 1)   -- one pass per column, not up+down
+  local horizontal = columns - 1              -- stepping between columns
+  local goHome     = (WIDTH - 1) + (LENGTH - 1) + (HEIGHT - 1)  -- worst case
   return vertical + horizontal + goHome
 end
 
 -- --- loot drop (reused by mid-dig offload and final drop) -------------
--- Assumes turtle is at (0,0). Places/reuses chests along +x at z=-1; chains
--- a new chest when one fills. Falls back to dumping into the room if chests
--- run out. Leaves the turtle back at (0,0) facing +z (into the room).
+-- Assumes turtle is at (0,0,0). Tries to place/reuse a chest facing the
+-- entrance (-z) first; falls back to the room interior (+z), which is
+-- guaranteed carved air with a solid floor. When a chest fills, chains a
+-- new one along +x (perpendicular to the facing). If no chest can be placed
+-- or slot 2 runs out, dumps loot into the room as a last resort. Leaves the
+-- turtle back at (0,0,0) facing +z (into the room).
 local function ensureChestAhead()
   if turtle.detect() then
     local ok, info = turtle.inspect()
@@ -401,9 +374,6 @@ local function ensureChestAhead()
 end
 
 local function dropLootAtHome()
-  -- Prefer placing chests at the entrance (-z); fall back to the room interior
-  -- (+z), which is guaranteed carved air with a solid floor. The entrance cell
-  -- is often solid if the turtle wasn't placed at a pre-dug tunnel mouth.
   local chestDirs = { { x = 0, z = -1 }, { x = 0, z = 1 } }
   local chestDir  = chestDirs[1]
   local placed    = false
@@ -421,14 +391,13 @@ local function dropLootAtHome()
     if turtle.getItemCount(s) > 0 then
       turtle.select(s)
       if groundFallback then
-        -- face into the room (+z, carved air) and dump on the ground
         turnTo({ x = 0, z = 1 }); turtle.drop(); turnTo(chestDir)
       else
         while turtle.getItemCount(s) > 0 do
           if turtle.drop() then
             -- slot emptied into the chest
           else
-            -- chest full: chain a new one along +x (perpendicular to chestDir)
+            -- chest full: chain a new one along +x
             if turtle.getItemCount(CHEST_SLOT) == 0 then
               notify("WARN", "Ran out of chests! Dumping remaining loot on the ground.")
               groundFallback = true
@@ -444,7 +413,6 @@ local function dropLootAtHome()
     end
   end
   turtle.select(1)
-  -- return to origin so callers know where we are
   if pos.x ~= 0 then
     turnTo({ x = -1, z = 0 })
     while pos.x ~= 0 do if not step() then break end end
@@ -460,7 +428,7 @@ local function inventoryFull()
 end
 
 -- --- pre-flight --------------------------------------------------------
-refuelAll(math.huge)   -- greedy: burn all fuel in every slot before reporting
+refuelFrom(FUEL_SLOT)   -- greedy: burn everything in the dedicated fuel slot
 do
   local have  = turtle.getFuelLevel()
   local need  = fuelNeeded()
@@ -494,7 +462,7 @@ while w < WIDTH do
     -- mid-dig offload when every loot slot is occupied
     if inventoryFull() then
       local tx, ty, tz = pos.x, pos.y, pos.z
-      setStatus("Inventory full — returning to drop loot...", doneColumns)
+      setStatus("Inventory full — returning to drop loot...")
       notify("FULL", "Inventory full; returning to start to offload loot.")
       if goTo(0, 0, 0) then
         dropLootAtHome()
@@ -506,14 +474,14 @@ while w < WIDTH do
     end
 
     setStatus(("Digging column W%d L%d (%s)"):format(
-          w + 1, l + 1, goingUp and "up" or "down"), doneColumns)
+          w + 1, l + 1, goingUp and "up" or "down"))
     if not mineColumn(goingUp) then break end
     doneColumns = doneColumns + 1
     goingUp = not goingUp    -- reverse vertical direction for the next column
 
     l = l + 1
     if l < LENGTH then
-      setStatus(("Moving to L%d"):format(l + 1), doneColumns)
+      setStatus(("Moving to L%d"):format(l + 1))
       if not step() then break end
     end
     saveState()   -- invariant: saved (w,l,goingUp) = next column to dig
@@ -523,7 +491,7 @@ while w < WIDTH do
   l = 0
   w = w + 1
   if w < WIDTH then
-    setStatus(("Stepping to width row %d"):format(w + 1), doneColumns)
+    setStatus(("Stepping to width row %d"):format(w + 1))
     turnTo({ x = 1, z = 0 })
     if not step() then break end
     lengthDir = -lengthDir
@@ -533,16 +501,16 @@ end
 
 -- --- return to start ---------------------------------------------------
 if aborting then
-  setStatus("ABORTED — returning home with loot...", doneColumns)
+  setStatus("ABORTED — returning home with loot...")
   notify("ABORT", "Dig aborted. Returning to start to drop what was mined.")
 else
-  setStatus("Returning to start...", doneColumns)
+  setStatus("Returning to start...")
 end
 goTo(0, 0, 0)
 turnTo({ x = 0, z = -1 })   -- face the entrance (-z) for the final drop
 
 -- --- drop loot ---------------------------------------------------------
-setStatus("Dropping loot...", doneColumns)
+setStatus("Dropping loot...")
 dropLootAtHome()
 
 -- --- final report ------------------------------------------------------
@@ -557,7 +525,7 @@ local blockSummary = (#blockBits > 0)
 local summary = ("Done. %d/%d columns, %d chest(s) used.%s%s"):format(
   doneColumns, totalColumns, chestsUsed,
   aborting and " (ABORTED early)" or "", blockSummary)
-setStatus(summary, doneColumns)
+setStatus(summary)
 notify("DONE", summary)
 clearState()
 print("")
