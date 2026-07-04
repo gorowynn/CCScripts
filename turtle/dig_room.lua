@@ -167,21 +167,25 @@ local function descendToFloor()
 end
 
 -- --- fuel -------------------------------------------------------------
--- Burns slot 1 first, then any fuel items in loot slots 3-16 (coal, lava
--- buckets, etc.). Loot fuel is consumed — caller asked for this fallback.
-local function refuelAll(target)
-  if turtle.getFuelLevel() == "unlimited" then return true end
-  target = target or 4000
-  turtle.select(FUEL_SLOT)
+-- Burn fuel from `slot` until level reaches `target` (default: max) or slot
+-- is empty. Greedy by default — pre-flight passes no target so all of slot 1
+-- is consumed.
+local function refuelFrom(slot, target)
+  if turtle.getFuelLevel() == "unlimited" then return end
+  target = target or math.huge
+  turtle.select(slot)
   while turtle.getFuelLevel() < target and turtle.refuel(1) do end
-  if turtle.getFuelLevel() < target then
-    for s = 3, 16 do
-      turtle.select(s)
-      while turtle.getFuelLevel() < target and turtle.refuel(1) do end
-    end
-  end
   turtle.select(1)
-  return turtle.getFuelLevel() >= target
+end
+
+-- Burns slot 1 first, then any fuel in loot slots 3-16. Mid-dig fallback tops
+-- up to `target` (default 4000) rather than torching all the loot coal.
+local function refuelAll(target)
+  target = target or 4000
+  refuelFrom(FUEL_SLOT, target)
+  if turtle.getFuelLevel() < target then
+    for s = 3, 16 do refuelFrom(s, target) end
+  end
 end
 
 -- --- ore logging ------------------------------------------------------
@@ -386,15 +390,15 @@ local function inventoryFull()
 end
 
 -- --- pre-flight --------------------------------------------------------
-refuelAll()
+refuelFrom(FUEL_SLOT)   -- greedy: burn everything in the fuel slot
 do
   local have  = turtle.getFuelLevel()
   local need  = fuelNeeded()
   local level = (have == "unlimited") and math.huge or have
   if level < need then
-    notify("FUEL", ("Need ~%d fuel, have %s. Refuel slot 1 and retry.")
+    -- warn but proceed; the turtle will pause for fuel mid-dig when it runs out
+    notify("FUEL", ("Need ~%d fuel, have %s. Starting anyway; will pause for refuel.")
            :format(need, tostring(have)))
-    return
   end
   term.clear()
   log(("Room %dx%dx%d  (need ~%d fuel, have %s)"):format(
