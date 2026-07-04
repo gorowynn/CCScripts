@@ -286,19 +286,24 @@ local function tryResume()
   local d = data.dims
   if d[1] ~= WIDTH or d[3] ~= LENGTH then return false end
   if mode == "room" and d[2] ~= HEIGHT then return false end
+  -- opt-in: never silently resume. Ask the user first.
+  local dc = data.doneColumns or 0
+  print(("Found in-progress %s job: %d/%d columns done."):format(mode, dc, totalColumns))
+  io.write("Resume it? [y/N]: ")
+  local s = io.read()
+  if not s or s:sub(1,1):lower() ~= "y" then return false end   -- start fresh
   pos, heading     = data.pos, data.heading
   w, l, lengthDir  = data.w, data.l, data.lengthDir
   goingUp          = data.goingUp
   if goingUp == nil then goingUp = true end
   carveX, carveZ, carveDir = data.carveX or 0, data.carveZ or 0, data.carveDir or 1
   surveyed         = data.surveyed or false
-  doneColumns      = data.doneColumns or 0
+  doneColumns      = dc
   aborting         = data.aborting or false
   chestsUsed       = data.chestsUsed or 0
   blockLog         = data.blockLog or data.oreLog or {}
   if mode == "hill" and data.perimeter then _G.perimeterHeights = data.perimeter end
-  notify("RESUME", ("Resuming %s at column %d/%d"):format(
-         mode, doneColumns, totalColumns))
+  notify("RESUME", ("Resuming %s at column %d/%d"):format(mode, dc, totalColumns))
   return true
 end
 
@@ -777,17 +782,17 @@ local function shaveColumn(target)
   end
   -- place filler going up until the turtle stands at target on a fresh block
   while pos.y < target do
-    if not turtle.up() then break end
-    pos.y = pos.y + 1
     if selectFiller() then
+      if not turtle.up() then break end
+      pos.y = pos.y + 1
       turtle.placeDown()   -- fills cell at pos.y - 1
       turtle.select(1)
     else
-      if not fillerWarned then
-        notify("WARN", "Out of filler blocks! Pits will be left unfilled.")
-        fillerWarned = true
-      end
-      turtle.select(1)
+      -- out of filler: pause for a refill (same pattern as the fuel pause).
+      notify("FILLER", "Out of filler! Add more " .. niceName(fillerName) ..
+             " to slots 3-16, then press any key.")
+      setStatus("OUT OF FILLER — waiting for refill...")
+      os.pullEvent("key")   -- loop retries selectFiller after the keypress
     end
   end
 end
