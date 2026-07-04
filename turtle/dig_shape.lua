@@ -798,6 +798,7 @@ local function shaveColumn(target)
 end
 
 local surface = {}   -- filled after survey / on resume
+local maxSurface = 0  -- highest target across all columns (traverse above this)
 
 local function fuelNeededHill()
   -- ponytail: rough. Survey ~ 4*(W+L) probe cells; carve ~ W*L * guessed
@@ -816,14 +817,24 @@ local function digHill()
     saveState()
     if aborting then return end
   end
+  -- compute the highest target so horizontal traversal stays above all ground
+  maxSurface = 0
+  for x = 0, WIDTH - 1 do
+    for z = 0, LENGTH - 1 do
+      if surface[x][z] > maxSurface then maxSurface = surface[x][z] end
+    end
+  end
   -- boustrophedon over interior columns. Resume continues from (carveX,carveZ).
   while carveX < WIDTH do
     if aborting then break end
     while (carveDir == 1 and carveZ <= LENGTH - 1) or (carveDir == -1 and carveZ >= 0) do
       if aborting then break end
       if not offloadIfFull({ x = 0, z = carveDir }) then break end
-      -- fly to (carveX, carveZ) over terrain (no ground dig), then shave down
-      if not flyTo(carveX, carveZ) then break end
+      -- traverse to (carveX, carveZ) ABOVE every target (maxSurface+1), using
+      -- the DIGGING goTo: any block above the surface was going to be removed
+      -- anyway, so digging through it is correct and never blocks. Staying
+      -- above maxSurface guarantees no ground (at/below target) is touched.
+      if not goTo(carveX, maxSurface + 1, carveZ) then break end
       setStatus(("Smoothing column W%d L%d"):format(carveX + 1, carveZ + 1))
       shaveColumn(surface[carveX][carveZ])
       doneColumns = doneColumns + 1
