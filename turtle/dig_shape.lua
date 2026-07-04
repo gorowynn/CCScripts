@@ -488,48 +488,49 @@ local function dropLootAtHome()
     -- keep filler-type items in inventory for pit-filling; don't offload them
     if fillerName then
       local item = turtle.getItemDetail(s)
-      if item and item.name == fillerName then
-        goto nextslot
-      end
+      if item and item.name == fillerName then goto nextslot end
     end
-    if turtle.getItemCount(s) > 0 then
-      turtle.select(s)
-      while turtle.getItemCount(s) > 0 do
-        turnTo(chestDir)
-        if turtle.drop() then
-          -- slot emptied into the chest
-        else
-          -- chest full (or blocked): chain a new one along +x, or wait if none
-          local chained = false
-          while turtle.getItemCount(s) > 0 do
-            local item2 = turtle.getItemDetail(CHEST_SLOT)
-            if not item2 or item2.name ~= "minecraft:chest" then
-              notify("CHEST", "Out of chests! Add more to slot 2, then press any key.")
-              setStatus("OUT OF CHESTS — add to slot 2, then press a key...")
-              os.pullEvent("key")
-            else
-              turnTo({ x = 1, z = 0 })
-              if not step() then break end
-              turnTo(chestDir)
-              if ensureChestAhead() then chained = true; break end
-            end
-          end
-          if not chained and turtle.getItemCount(s) > 0 then
-            -- step failed or placement blocked: wait for the user to resolve
-            notify("CHEST", "Can't chain a chest. Clear/+place space, then press any key.")
-            setStatus("WAITING FOR CHEST — then press a key...")
+    if turtle.getItemCount(s) == 0 then goto nextslot end
+
+    turtle.select(s)
+    -- Drop this slot, chaining chests along +x as they fill. Each pass: face
+    -- the chest ahead, try to drop. If the chest is full, step +x to the next
+    -- cell and ensure a chest there (place or reuse). When the slot empties,
+    -- return to x=0 before the next slot so every slot starts at chest #1.
+    while turtle.getItemCount(s) > 0 do
+      turnTo(chestDir)
+      if turtle.drop() then
+        -- something fit; keep dropping into this chest until full or slot empty
+      else
+        -- chest full (or no chest ahead): advance +x to chain a new chest
+        while true do
+          turnTo({ x = 1, z = 0 })
+          if not step() then
+            -- blocked: wait for the user to clear the row
+            notify("CHEST", "Can't advance along +x. Clear the cell, then press any key.")
+            setStatus("WAITING — clear +x row, then press a key...")
             os.pullEvent("key")
+          else
+            break
           end
         end
+        turnTo(chestDir)
+        -- place/reuse a chest ahead; if none in slot 2 or blocked, wait + retry
+        while not ensureChestAhead() do
+          notify("CHEST", "Need a chest in slot 2 (or clear the cell ahead). Press any key.")
+          setStatus("WAITING FOR CHEST — add to slot 2, then press a key...")
+          os.pullEvent("key")
+        end
       end
+    end
+    -- return to x=0 so the next slot starts at chest #1 (which may have space)
+    if pos.x ~= 0 then
+      turnTo({ x = -1, z = 0 })
+      while pos.x ~= 0 do if not step() then break end end
     end
     ::nextslot::
   end
   turtle.select(1)
-  if pos.x ~= 0 then
-    turnTo({ x = -1, z = 0 })
-    while pos.x ~= 0 do if not step() then break end end
-  end
   turnTo({ x = 0, z = 1 })
 end
 
