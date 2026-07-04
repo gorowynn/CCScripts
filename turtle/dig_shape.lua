@@ -165,6 +165,7 @@ local totalColumns = WIDTH * LENGTH                  -- room progress total
 local doneColumns  = 0                               -- room progress done
 local totalLayers  = (mode == "hill") and HIGH or 0  -- hill progress total
 local doneLayers   = 0                               -- hill progress done
+local startTime    = os.clock()                       -- for ETA (process time)
 local pos          = { x = 0, y = 0, z = 0 }
 local heading      = { x = 0, z = 1 }
 -- room sweep cursors
@@ -179,21 +180,31 @@ local chestsUsed   = 0
 local blockLog     = {}         -- block name (no namespace) -> count
 
 -- --- live status display ----------------------------------------------
+-- Format seconds into a short human-ish duration (e.g. "2m 13s", "1h 4m").
+local function fmtTime(s)
+  s = math.floor(s or 0)
+  if s < 60 then return s .. "s" end
+  if s < 3600 then return math.floor(s/60) .. "m " .. (s%60) .. "s" end
+  return math.floor(s/3600) .. "h " .. math.floor((s%3600)/60) .. "m"
+end
+
 local function setStatus(msg)
   term.setCursorPos(1, 1); term.clearLine(); term.write(msg or "")
   term.setCursorPos(1, 2); term.clearLine()
-  if mode == "hill" then
-    term.write(("Progress: %d / %d layers  (%d%%)"):format(
-          doneLayers, totalLayers,
-          math.floor(doneLayers / totalLayers * 100)))
-  else
-    term.write(("Progress: %d / %d columns  (%d%%)"):format(
-          doneColumns, totalColumns,
-          math.floor(doneColumns / totalColumns * 100)))
-  end
+  local done, total
+  if mode == "hill" then done, total = doneLayers, totalLayers
+  else                  done, total = doneColumns, totalColumns end
+  term.write(("Progress: %d / %d  (%d%%)"):format(
+        done, total, math.floor(done / total * 100)))
+  -- ETA: average process-time per unit so far * remaining.
+  -- ponytail: os.clock() is CPU time, excludes sleep/idle (e.g. fuel pause),
+  -- so ETA skews low during waits — acceptable on a small terminal where we
+  -- can't fit a wall-clock row too.
   term.setCursorPos(1, 3); term.clearLine()
-  term.write(("Fuel: %s   |   loot slots 3-16   |   chests used: see log")
-             :format(tostring(turtle.getFuelLevel())))
+  local elapsed = os.clock() - startTime
+  local eta = (done > 0) and (elapsed / done) * (total - done) or nil
+  local etaStr = eta and ("  ETA %s"):format(fmtTime(eta)) or ""
+  term.write(("Fuel: %s%s"):format(tostring(turtle.getFuelLevel()), etaStr))
 end
 
 local function log(msg)
