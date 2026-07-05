@@ -117,6 +117,21 @@ local function humanize(s)
     if s:find("_") then s = s:gsub("_", " ") end
     return s:sub(1, 1):upper() .. s:sub(2)
 end
+
+-- compact integer: 1234 -> "1.2k", 12500 -> "12.5k", 1500000 -> "1.5M"
+local function compact(n)
+    n = tonumber(n) or 0
+    local a = math.abs(n)
+    if a >= 1000000 then return string.format("%.1fM", n / 1000000):gsub("%.0", "") end
+    if a >= 1000    then return string.format("%.1fk", n / 1000):gsub("%.0", "") end
+    return tostring(n)
+end
+
+-- rise/fall since the previous snapshot for one item id on a node
+local function deltaOf(n, id, count)
+    if not n or not n._prev then return 0 end
+    return (count or 0) - (n._prev[id] or count or 0)
+end
 -- "minecraft:oak_log" -> "minecraft"
 -- path part of a registry id: "minecraft:raw_iron" -> "raw_iron"
 local function pathOf(id)
@@ -218,9 +233,20 @@ end
 --  ROW MODEL  ·  flatten nodes -> groups -> items into a pageable row list
 --===========================================================================
 -- row shapes:
---   { kind="node",  name, n }
---   { kind="group", key, gname, total, types, expanded }
---   { kind="item",  text, count, max }
+--   { kind="node",   name, n }
+--   { kind="group",  key, gname, total, types, open }
+--   { kind="modsub", key, text, total, types, open }
+--   { kind="items2", left, right, max, node }   -- two items per row for density
+
+-- ponytail: pair items two-per-row so wide monitors show ~2x the stock
+local function pushItemRows(rows, items, max, n)
+    local i = 1
+    while i <= #items do
+        rows[#rows + 1] = { kind = "items2",
+            left = items[i], right = items[i + 1], max = max, node = n }
+        i = i + 2
+    end
+end
 local function buildRows()
     local rows = {}
     for _, name in ipairs(nodeNames()) do
@@ -257,19 +283,11 @@ local function buildRows()
                             text = e.name, total = e.total, types = #e.items,
                             key = mk, open = mopen }
                         if mopen then
-                            for _, it in ipairs(e.items) do
-                                rows[#rows + 1] = { kind = "item",
-                                    text = humanize(it.name or it.id),
-                                    count = it.count or 0, max = g.max }
-                            end
+                            pushItemRows(rows, e.items, g.max, n)
                         end
                     end
                 else
-                    for _, it in ipairs(g.items) do
-                        rows[#rows + 1] = { kind = "item",
-                            text = humanize(it.name or it.id),
-                            count = it.count or 0, max = g.max }
-                    end
+                    pushItemRows(rows, g.items, g.max, n)
                 end
             end
         end
@@ -361,16 +379,30 @@ local function render()
             writeAt(5, y, string.lower(r.text), THEME.text)
             writeRight(W - 2, y, string.format("%d / %d t", r.total, r.types), THEME.dim)
             ui.touch[#ui.touch + 1] = { y = y, key = r.key }
-        else -- item
-            local cnt = tostring(r.count)
-            local col = r.max > 0 and ratioColour(r.count / r.max) or THEME.text
-            writeAt(2, y, r.text, THEME.dim)
-            local dotStart = 2 + #r.text + 1
-            local dotEnd   = (W - 2) - #cnt - 1
-            if dotEnd >= dotStart then
-                writeAt(dotStart, y, string.rep(".", dotEnd - dotStart + 1), THEME.faint)
+        elseif r.kind == "items2" then
+            -- two-column item row:  [^ name..... cnt] | [^ name..... cnt]
+            local cellW = math.floor((W - 3) / 2)
+            local lx, rx = 2, cellW + 3
+            local sep    = cellW + 2
+            local function cell(x, w, it)
+                if not it then return end
+                local cnt = compact(it.count or 0)
+                local d   = deltaOf(r.node, it.id, it.count)
+                local arrow = d > 0 and "^" or (d < 0 and "v" or " ")
+                local acol  = d > 0 and THEME.good or (d < 0 and THEME.warn or THEME.faint)
+                local name  = humanize(it.name or it.id)
+                local cap   = w - #cnt - 2          -- arrow(1) + gap(1) + count
+                if #name > cap then name = name:sub(1, math.max(1, cap - 1)) .. "." end
+                writeAt(x, y, arrow, acol)
+                writeAt(x + 1, y, name, THEME.dim)
+                local col = r.max > 0 and ratioColour((it.count or 0) / r.max) or THEME.text
+                writeRight(x + w - 1, y, cnt, col)
             end
-            writeRight(W - 2, y, cnt, col)
+            cell(lx, cellW, r.left)
+            if r.right then
+                writeAt(sep, y, "|", THEME.faint)
+                cell(rx, cellW, r.right)
+            end
         end
         y = y + 1
     end
@@ -454,6 +486,13 @@ while true do
     if e == "rednet_message" then
         local _, msg, prot = unpack(event, 2)
         if prot == CONFIG.PROT and type(msg) == "table" and msg.node and msg.items then
+            -- snapshot previous counts so the renderer can show rise/fall arrows
+            local old = nodes[msg.node]
+            if old and old.items then
+                local prev = {}
+                for _, it in ipairs(old.items) do prev[it.id] = it.count or 0 end
+                msg._prev = prev
+            end
             nodes[msg.node] = msg
             render()
         end
