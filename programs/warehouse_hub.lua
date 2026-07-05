@@ -191,7 +191,12 @@ local function groupsOf(n)
     end
     local list = {}
     for _, e in pairs(g) do list[#list + 1] = e end
-    table.sort(list, function(a, b) return a.total > b.total end)
+    table.sort(list, function(a, b)
+        -- Misc always sinks to the bottom; everything else by total desc
+        if a.name == "Misc" then return false end
+        if b.name == "Misc" then return true end
+        return a.total > b.total
+    end)
     for _, e in ipairs(list) do
         table.sort(e.items, function(a, b) return (a.count or 0) > (b.count or 0) end)
     end
