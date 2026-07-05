@@ -7,7 +7,7 @@
 -- warehouse_hub: accent title bar (row 1), evenly-split tab bar (row 2),
 -- faint footer (row H) with < / > nav, per-view accent colours.
 --
---   DASHBOARD  -- energy bar, power in/out + net, item/fluid storage + types,
+--   DASHBOARD  -- total item IN/OUT + delta per second, item/fluid storage + types,
 --                  craftable count, and a TOP-5 MOVERS preview.
 --   MOVERS     -- headline view: items & fluids ranked by total flow rate
 --                  (|in/s| + |out/s|) over the rate window, with in/out/net cols.
@@ -40,7 +40,8 @@ local CONFIG = {
     refreshHz   = 10,      -- screen redraws per second (default 10 = every 0.1s)
     pollHz      = 2,       -- me_bridge polls per second (delta granularity)
     windowSec   = 5,       -- rate window: in/out/s averaged over this many seconds
-    topN        = 10,      -- leaderboard size
+    topN        = 10,      -- leaderboard size (ITEMS / FLUIDS views)
+    moversN     = 15,      -- MOVERS view: top-N items & fluids by flow
 }
 
 --===========================================================================
@@ -165,14 +166,22 @@ local function fmtRate(n)
     if a < 10 then return string.format("%.1f", n) end
     return string.format("%.0f", n)
 end
--- direction arrow for a signed flow value (net). \226\134\145 = ↑, \226\134\147 = ↓
+-- direction arrow for a signed flow value (net).
+-- ASCII ^/v/- : single-byte so writeAt/writeRight column math stays correct
+-- (unicode arrows are 3 bytes/1 cell and break the byte-length positioning).
 local function arrowOf(n)
     n = tonumber(n) or 0
-    if n > 0.005 then return "\226\134\145" end   -- rising
-    if n < -0.005 then return "\226\134\147" end  -- falling
-    return "-"                                       -- stable
+    if n > 0.005 then return "^" end   -- rising
+    if n < -0.005 then return "v" end  -- falling
+    return "-"                        -- stable
 end
-local function fmtEnergy(n) return fmtNum(n) .. " AE" end
+local function arrowColour(n)
+    n = tonumber(n) or 0
+    if n > 0.005 then return THEME.good end
+    if n < -0.005 then return THEME.bad end
+    return THEME.dim
+end
+local function fmtEnergy(n) return fmtNum(n) .. " AE" end -- ponytail: unused after energy stats dropped; kept for ad-hoc reuse
 
 -- truncate text to width with an ellipsis char (\187 = >>)
 local function trunc(s, w)
@@ -203,49 +212,12 @@ local function safeCall(method, ...)
     return nil
 end
 
--- try a list of method names; return first non-nil raw result
-local function tryMethods(names, ...)
-    for _, m in ipairs(names) do
-        local r = safeCall(m, ...)
-        if r ~= nil then return r end
-    end
-    return nil
-end
-
-local function avgOf(res)
-    if res == nil then return nil end
-    if type(res) == "number" then return res end
-    if type(res) == "table" then
-        return res.avg or res.average or res.value or res[1]
-    end
-    return nil
-end
-
 local function keyOf(it) return it.name .. (it.nbt and ("/" .. it.nbt) or "") end
 
 local function snapshot()
     local items  = safeCall("listItems")   or safeCall("getItems")   or {}
     local fluids = safeCall("listFluids")  or safeCall("getFluids")  or {}
     local craft  = safeCall("listCraftables") or safeCall("getCraftables") or {}
-    local energy    = tonumber(tryMethods({ "getEnergy", "getEnergyStored", "getStoredEnergy", "getCurrentAmpere", "getStoredPower" })) or 0
-    local maxEnergy = tonumber(tryMethods({ "getMaxEnergy", "getMaxEnergyStored", "getMaxStoredPower", "getMaxStorage", "getStoredMaxEnergy" })) or 0
-    -- ponytail: AP renamed avg-power methods across versions; try them all.
-    local pinj = avgOf(tryMethods({
-        "getAvgPowerInjection", "getAveragePowerInjection", "getAvgInjection",
-        "getPowerInjection", "getInjection", "getInputRate",
-    }))
-    local puse = avgOf(tryMethods({
-        "getAvgPowerUsage", "getAveragePowerUsage", "getAvgUsage",
-        "getPowerUsage", "getUsage", "getOutputRate",
-    }))
-    -- some builds bury power inside getConfiguration()
-    if pinj == nil and puse == nil then
-        local cfg = safeCall("getConfiguration")
-        if type(cfg) == "table" then
-            pinj = avgOf(cfg.avgInjection or cfg.powerInjection or cfg.injection)
-            puse = avgOf(cfg.avgUsage  or cfg.powerUsage  or cfg.usage)
-        end
-    end
     local usedItem  = safeCall("getUsedItemStorage")
     local totalItem = safeCall("getTotalItemStorage")
     local usedFluid  = safeCall("getUsedFluidStorage")
@@ -282,8 +254,6 @@ local function snapshot()
         items = itemMap, itemCount = itemCount, itemTypes = itemTypes,
         fluids = fluidMap, fluidAmount = fluidAmount, fluidTypes = fluidTypes,
         craftables = craftNames,
-        energy = energy, maxEnergy = maxEnergy,
-        pinj = pinj, puse = puse,
         usedItem = usedItem, totalItem = totalItem,
         usedFluid = usedFluid, totalFluid = totalFluid,
     }
@@ -304,14 +274,11 @@ local history = { items = {}, fluids = {} }
 local meta = { items = {}, fluids = {} }   -- meta[kind][key] = { display, cur }
 local prev = { items = nil, fluids = nil }
 local sinceStart = os.epoch("utc")  -- ponytail: retained for future uptime display
--- energy ring (for deriving NET AE/t when the bridge lacks avg-power methods)
-local energyHist = {}   -- oldest..newest { t=ms, e=energy }
 
 local function resetCounters()
     history = { items = {}, fluids = {} }
     meta    = { items = {}, fluids = {} }
     prev    = { items = nil, fluids = nil }
-    energyHist = {}
     sinceStart = os.epoch("utc")
 end
 
@@ -409,32 +376,14 @@ local function topBy(kind, sortField, n)
     return list
 end
 
--- push energy sample into the ring; trim to window
-local function pushEnergy(e, nowMs)
-    energyHist[#energyHist + 1] = { t = nowMs, e = tonumber(e) or 0 }
-    local cutoff = nowMs - CONFIG.windowSec * 1000
-    while #energyHist > 2 and energyHist[1].t < cutoff do table.remove(energyHist, 1) end
-end
-
--- NET AE/t from energy deltas (fallback when bridge lacks avg-power methods)
-local function netPowerFromEnergy()
-    if #energyHist < 2 then return nil end
-    local dt = (energyHist[#energyHist].t - energyHist[1].t) / 1000
-    if dt <= 0 then return nil end
-    return (energyHist[#energyHist].e - energyHist[1].e) / dt
-end
-
--- resolve {inj, use, net} for a snapshot: prefers bridge avg-power; falls back
--- to energy-delta for net. Each field may be nil if not derivable.
-local function resolvePower(s)
-    local inj, use = s.pinj, s.puse
-    local net
-    if inj or use then
-        net = (inj or 0) - (use or 0)
-    else
-        net = netPowerFromEnergy()
+-- aggregate per-second flow across all entries of a kind (dashboard totals)
+local function aggregateRates(kind)
+    local totIn, totOut = 0, 0
+    for k in pairs(meta[kind]) do
+        local ir, or_ = ratesFor(kind, k)
+        totIn = totIn + ir; totOut = totOut + or_
     end
-    return inj, use, net
+    return totIn, totOut
 end
 
 --===========================================================================
@@ -462,7 +411,6 @@ local function poll()
     lastError = nil
     local now = os.epoch("utc")
     applySnapshot(s, now)
-    pushEnergy(s.energy, now)
     curSnap = s
     lastPollAt = now
 end
@@ -530,6 +478,36 @@ local function statRow(x, y, w, label, value, vcol)
     return y + 1
 end
 
+-- one mover row: [rank] arrow NAME..   IN/s   OUT/s
+-- arrow encodes net direction; spacing tuned so columns never overlap.
+-- ponytail: single-byte ^/v/- keeps writeRight byte-length math correct.
+local SLOT_W = 8   -- max width of a rate cell ("9999/s" + margin)
+local function drawMoverHeader(x, y, w, withRank)
+    local outRight = x + w - 1
+    local inRight  = outRight - SLOT_W - 1
+    local nameX    = x + (withRank and 5 or 2)
+    writeAt(nameX, y, "ITEM", THEME.dim)
+    writeRight(inRight,  y, "IN/s",  THEME.incol)
+    writeRight(outRight, y, "OUT/s", THEME.outcol)
+end
+local function drawMoverRow(x, y, w, rank, e)
+    local outRight = x + w - 1
+    local inRight  = outRight - SLOT_W - 1
+    local nameEnd  = inRight - 2
+    local nameX    = x + 2
+    if rank then
+        writeAt(x, y, string.format("%2d.", rank), THEME.faint)
+        nameX = x + 5
+    end
+    writeAt(nameX, y, arrowOf(e.netRate), arrowColour(e.netRate))
+    local nameW = nameEnd - (nameX + 1) + 1
+    if nameW > 1 then
+        writeAt(nameX + 1, y, trunc(e.display, nameW), THEME.text)
+    end
+    writeRight(inRight,  y, fmtRate(e.inRate)  .. "/s", THEME.incol)
+    writeRight(outRight, y, fmtRate(e.outRate) .. "/s", THEME.outcol)
+end
+
 -- render a leaderboard column at (x,y) with width colW, listH rows
 -- valField: "in"->inRate, "out"->outRate, "flow", "net", "cur"
 local function fieldValue(e, valField)
@@ -581,27 +559,16 @@ local function viewDashboard(bodyY)
 
     -- ===== LEFT RAIL =====
     local ry = bodyY
-    writeAt(railX, ry, "[ NETWORK ]", THEME.accent); ry = ry + 1
+    writeAt(railX, ry, "[ FLOW ]", THEME.accent); ry = ry + 1
     fillRow(railX, ry, railW, THEME.faint); ry = ry + 1
 
-    -- energy
-    local er = s.maxEnergy and s.maxEnergy > 0 and (s.energy / s.maxEnergy) or 0
-    ry = statRow(railX, ry, railW, "ENERGY", fmtEnergy(s.energy), ratioColour(er))
-    gauge(railX, ry, railW, er, ratioColour(er), THEME.faint); ry = ry + 2
-
-    -- power: prefer bridge avg-power; fall back to energy-delta for NET
-    local pinj, puse, pnet = resolvePower(s)
-    ry = statRow(railX, ry, railW, "POWER IN",
-        pinj and (fmtNum(pinj) .. " AE/t") or "--", THEME.incol)
-    ry = statRow(railX, ry, railW, "POWER OUT",
-        puse and (fmtNum(puse) .. " AE/t") or "--", THEME.outcol)
-    if pnet ~= nil then
-        ry = statRow(railX, ry, railW, "NET",
-            string.format("%s%.1f AE/t", pnet >= 0 and "+" or "-", math.abs(pnet)),
-            pnet >= 0 and THEME.good or THEME.bad)
-    else
-        ry = statRow(railX, ry, railW, "NET", "--", THEME.faint)
-    end
+    -- aggregate item flow over the rate window
+    local totIn, totOut = aggregateRates("items")
+    local delta = totIn - totOut
+    ry = statRow(railX, ry, railW, "TOTAL IN",  fmtRate(totIn)  .. "/s", THEME.incol)
+    ry = statRow(railX, ry, railW, "TOTAL OUT", fmtRate(totOut) .. "/s", THEME.outcol)
+    ry = statRow(railX, ry, railW, "DELTA",
+        arrowOf(delta) .. " " .. fmtRate(math.abs(delta)) .. "/s", arrowColour(delta))
     ry = ry + 1
 
     writeAt(railX, ry, "[ STORAGE ]", THEME.accent); ry = ry + 1
@@ -623,8 +590,8 @@ local function viewDashboard(bodyY)
     else
         ry = statRow(railX, ry, railW, "FLUID AMOUNT", fmtNum(s.fluidAmount) .. " mB", THEME.text)
     end
-    local _, craftN = nil, 0
-    do local c = 0; for _ in pairs(s.craftables) do c = c + 1 end craftN = c end
+    local craftN = 0
+    for _ in pairs(s.craftables) do craftN = craftN + 1 end
     ry = ry + 1
     ry = statRow(railX, ry, railW, "CRAFTABLE", fmtNum(craftN), THEME.info)
     ry = statRow(railX, ry, railW, "RATE WINDOW", CONFIG.windowSec .. "s", THEME.dim)
@@ -634,28 +601,18 @@ local function viewDashboard(bodyY)
     local my = bodyY
     writeAt(rightX, my, "[ TOP MOVERS ]", THEME.viewAccent[VI.MOVERS]); my = my + 1
     fillRow(rightX, my, rightW, THEME.faint); my = my + 1
-
-    -- header line
-    local nameW = rightW - 18
-    writeAt(rightX, my, trunc("ITEM", nameW), THEME.dim)
-    writeRight(rightX + nameW + 4, my, "IN/s", THEME.incol)
-    writeRight(rightX + nameW + 9, my, "OUT/s", THEME.outcol)
-    writeRight(rightX + rightW - 1, my, "NET/s", THEME.dim)
-    my = my + 1
-
+    if rightW < 22 then
+        writeAt(rightX, my, "panel too narrow", THEME.faint)
+        return
+    end
+    drawMoverHeader(rightX, my, rightW, false); my = my + 1
     local movers = topBy("items", "flow", 5)
     if #movers == 0 then
-        writeAt(rightX, my, "no flow in last "..CONFIG.windowSec.."s", THEME.faint)
+        writeAt(rightX, my, "no flow in last " .. CONFIG.windowSec .. "s", THEME.faint)
     else
         for i = 1, #movers do
             if my > H - 1 then break end
-            local e = movers[i]
-            writeAt(rightX, my, trunc(e.display, nameW), THEME.text)
-            writeRight(rightX + nameW + 4, my, fmtRate(e.inRate) .. "/s", THEME.incol)
-            writeRight(rightX + nameW + 9, my, fmtRate(e.outRate) .. "/s", THEME.outcol)
-            local ncol = e.netRate >= 0 and THEME.good or THEME.bad
-            writeRight(rightX + rightW - 1, my, arrowOf(e.netRate) .. fmtRate(math.abs(e.netRate)) .. "/s", ncol)
-            my = my + 1
+            drawMoverRow(rightX, my, rightW, nil, movers[i]); my = my + 1
         end
     end
 end
@@ -670,8 +627,9 @@ local function viewMovers(bodyY)
     local xs = { 2, colW + 3 }
     local listH = bodyH - 2  -- title + header line
 
-    local items  = topBy("items", "flow", 999)
-    local fluids = topBy("fluids", "flow", 999)
+    -- top-N per kind, configurable; paging within that set
+    local items  = topBy("items", "flow", CONFIG.moversN)
+    local fluids = topBy("fluids", "flow", CONFIG.moversN)
     local maxPage = math.max(1, math.ceil(math.max(#items, #fluids) / listH))
     local pg = ensurePage(VI.MOVERS, maxPage)
     local startIdx = (pg - 1) * listH + 1
@@ -680,27 +638,27 @@ local function viewMovers(bodyY)
         local kind = (ci == 1) and "items" or "fluids"
         local list = (ci == 1) and items or fluids
         local x = xs[ci]
-        local title = string.format("%s MOVERS  /s", string.upper(kind:sub(1,1))..kind:sub(2))
+        local title = string.format("%s MOVERS  top %d  /s",
+            string.upper(kind:sub(1,1))..kind:sub(2), CONFIG.moversN)
         writeAt(x, bodyY, title, THEME.viewAccent[VI.MOVERS])
         fillRow(x, bodyY + 1, colW, THEME.faint)
-        -- column sub-header
-        local nameW = colW - 22
-        writeAt(x, bodyY + 2, "ITEM", THEME.dim)
-        writeRight(x + nameW + 5,  bodyY + 2, "IN/s", THEME.incol)
-        writeRight(x + nameW + 10, bodyY + 2, "OUT/s", THEME.outcol)
-        writeRight(x + nameW + 16, bodyY + 2, "NET/s", THEME.dim)
+        if colW >= 22 then
+            drawMoverHeader(x, bodyY + 2, colW, true)
+        end
         for i = 1, listH do
             local idx = startIdx + i - 1
             local e = list[idx]
             local yy = bodyY + 2 + i
             if yy > bodyBot then break end
             if e then
-                writeAt(x, yy, string.format("%2d.", idx), THEME.faint)
-                writeAt(x + 4, yy, trunc(e.display, nameW), THEME.text)
-                writeRight(x + nameW + 5,  yy, fmtRate(e.inRate) .. "/s", THEME.incol)
-                writeRight(x + nameW + 10, yy, fmtRate(e.outRate) .. "/s", THEME.outcol)
-                local ncol = e.netRate >= 0 and THEME.good or THEME.bad
-                writeRight(x + nameW + 16, yy, arrowOf(e.netRate) .. fmtRate(math.abs(e.netRate)) .. "/s", ncol)
+                if colW < 22 then
+                    -- too narrow for full layout: just rank + arrow + name
+                    writeAt(x, yy, string.format("%2d.", idx), THEME.faint)
+                    writeAt(x + 4, yy, arrowOf(e.netRate), arrowColour(e.netRate))
+                    writeAt(x + 6, yy, trunc(e.display, colW - 6), THEME.text)
+                else
+                    drawMoverRow(x, yy, colW, idx, e)
+                end
             end
         end
     end
