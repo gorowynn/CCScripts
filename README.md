@@ -84,14 +84,20 @@ four touch-driven views on an Advanced Monitor:
 
 - **Overview** — energy bar, avg power in/out (AE/t) and net, item-type count,
   fluid-type count, item/fluid byte storage (with gauge when the bridge exposes
-  it), and a current top-5 by stored amount.
-- **Top Items** — three side-by-side leaderboards since start: **Top IN**, **Top
-  OUT**, **Top STORED**. In/out is computed by diffing per-item stored counts
-  between polls and accumulating the deltas. Press **`R`** (or the `R` key) to
-  reset the counters.
-- **Top Fluids** — same three leaderboards for fluids (mB).
+  it), and a current top-5 **movers** preview.
+- **Movers** — headline view: items & fluids ranked by total flow rate
+  (`|in/s| + |out/s|`) over the rate window, with `IN/s`, `OUT/s`, `NET/s`
+  columns.
+- **Items / Fluids** — three leaderboards each: `TOP IN/s`, `TOP OUT/s`,
+  `TOP STORED`.
 - **Crafting** — every craftable item, flagged `crafting` when the bridge
   reports an active job (queried for the first 20 rows to stay cheap).
+
+In/out rates are computed by diffing per-item stored counts between polls and
+bucketing each poll's delta by direction (rising poll → in, falling poll → out),
+summed over a rolling `windowSec` window (default 5s) and divided by elapsed
+seconds. The screen redraws at `refreshHz` (default **10/s**); the bridge is
+polled at `pollHz` (default 2/s). Press **`R`** to flush the rate window.
 
 **Requirements:**
 
@@ -115,14 +121,15 @@ four touch-driven views on an Advanced Monitor:
    ae2_monitor
    ```
 
-**Controls:** tap the **tabs** to switch views; tap **`<` / `>`** footer (or
-the left/right half of the footer) to page leaderboards; **`R`** key resets
-in/out counters; **`r`** redraws, **`q`** quits.
+**Controls:** tap the **tabs** to switch views (or `left`/`right` keys); tap
+**`<` / `>`** footer (or the left/right half of the footer) to page leaderboards;
+**`R`** key flushes the rate window; **`r`** redraws, **`q`** quits.
 
-**Tuning:** edit the `CONFIG` table at the top — `poll` (delta window in
-seconds), `refresh` (frame redraw interval), `textScale`, `monitorSide` /
-`bridgeSide` overrides, and `topN` leaderboard size. In/out counters are
-in-memory only and reset on restart — add disk logging if you need history.
+**Tuning:** edit the `CONFIG` table at the top — `refreshHz` (screen redraws/s,
+default 10), `pollHz` (bridge polls/s, default 2), `windowSec` (rate-averaging
+window in seconds, default 5), `textScale`, `monitorSide` / `bridgeSide`
+overrides, and `topN` leaderboard size. Rates are in-memory only and reset on
+restart — add disk logging if you need history.
 
 ## Installing a script in-game
 
