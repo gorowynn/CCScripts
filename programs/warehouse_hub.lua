@@ -118,8 +118,46 @@ local function humanize(s)
     return s:sub(1, 1):upper() .. s:sub(2)
 end
 -- "minecraft:oak_log" -> "minecraft"
-local function modOf(id)
-    return tostring(id):match("^(%w+):") or "other"
+-- path part of a registry id: "minecraft:raw_iron" -> "raw_iron"
+local function pathOf(id)
+    return (tostring(id):gsub("^[%w_]+:", ""))
+end
+
+-- ponytail: heuristic classifier on the registry path. Forge/NeoForge tags
+-- (c:ores, c:foods, ...) are NOT reachable via CC's inventory API — getItemDetail
+-- returns a registry id, no tag membership. So we bucket by id pattern. First
+-- matching rule wins; extend RULES in order. "Misc" catches the rest.
+local RULES = {
+    { "Tools",   { "_pickaxe$", "_axe$", "_shovel$", "_hoe$", "_sword$", "_bow$",
+                   "crossbow$", "fishing_rod$", "shears$", "flint_and_steel$", "shield$" } },
+    { "Armor",   { "_helmet$", "_chestplate$", "_leggings$", "_boots$" } },
+    { "Ores",    { "_ore$", "^raw_" } },
+    { "Metals",  { "_ingot$", "_nugget$", "_dust$", "_gear$", "_plate$", "_rod$",
+                   "_wire$", "_gem$", "_crystal$", "^coal$", "^charcoal$", "^diamond$",
+                   "^emerald$", "^quartz$", "^lapis_lazuli$", "^redstone$", "^netherite_" } },
+    { "Wood",    { "_log$", "_planks$", "_leaves$", "_sapling$", "^stick$" } },
+    { "Stone",   { "cobblestone", "^stone$", "_stone$", "^dirt$", "^sand$", "^gravel$",
+                   "^sandstone", "^netherrack", "^end_stone", "^obsidian", "^deepslate",
+                   "^granite", "^diorite", "^andesite", "^clay", "^terracotta", "^brick",
+                   "glass", "^ice", "^snow$", "^cactus$" } },
+    { "Redstone",{ "redstone", "repeater", "comparator", "piston", "dispenser", "dropper",
+                   "observer", "hopper", "lever", "_button$", "_pressure_plate$", "_rail$",
+                   "^tnt", "^note_block$", "^daylight_detector", "^tripwire" } },
+    { "Food",    { "bread", "apple", "^beef", "porkchop", "^cooked_", "mutton", "^chicken",
+                   "^rabbit", "^cod", "^salmon", "^fish", "cookie", "melon_slice",
+                   "sweet_berries", "glow_berries", "^carrot", "^potato", "^beetroot",
+                   "^cake", "pumpkin_pie", "stew", "^honey_bottle", "^milk_bucket",
+                   "^dried_kelp", "^sugar$", "^wheat$", "^egg$", "kelp", "seeds$" } },
+}
+
+local function categoryOf(id)
+    local p = pathOf(id)
+    for _, rule in ipairs(RULES) do
+        for _, pat in ipairs(rule[2]) do
+            if p:find(pat) then return rule[1] end
+        end
+    end
+    return "Misc"
 end
 
 --===========================================================================
@@ -138,12 +176,12 @@ local function nodeNames()
     return t
 end
 
--- group a node's items by mod namespace
+-- group a node's items by category (heuristic; see categoryOf)
 -- returns ordered list: { name=mod, items={...}, total=N, types=N, max=count-of-largest }
 local function groupsOf(n)
     local g = {}
     for _, it in ipairs(n.items or {}) do
-        local m = modOf(it.id)
+        local m = categoryOf(it.id)
         local e = g[m]
         if not e then e = { name = m, items = {}, total = 0, types = 0, max = 0 }; g[m] = e end
         e.items[#e.items + 1] = it
