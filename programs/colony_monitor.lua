@@ -1,27 +1,28 @@
 --===========================================================================
--- Colony Monitor  ·  a modern SCADA-inspired dashboard for MineColonies
---===========================================================================
--- For CC:Tweaked on Minecraft 1.21.1.
--- Requires:  Advanced Peripherals (colony_integrator peripheral), MineColonies
---            and an Advanced Monitor (golden border) for colour.
+-- colony_monitor.lua  ·  SCADA MineColonies colony overview
+-- Polls the Advanced Peripherals `colony_integrator` every few seconds and
+-- renders a live, touch-driven dashboard on an Advanced Monitor: Action Board,
+-- Dashboard, Buildings, Citizens, Workforce and a collapsible Research tree.
 --
--- Features:
---   * Auto-detects monitor + colony integrator and adapts layout to size
---   * Touch tabs (+ arrow keys / 1-4 on a computer) to switch views
---   * Dashboard  — colony stats, alerts, active requests, visitors
---   * Buildings  — every building with level gauges, guard/storage/upgrade state
---   * Citizens   — every citizen with job, mood, saturation, health
---   * Research   — the full research tree with status LEDs + progress
+-- Hardware: Computer + Advanced Monitor (touch) adjacent to a Colony Integrator
+--           (Advanced Peripherals) near a MineColonies Town Hall.
+-- Run:      colony_monitor        (`colony_monitor test` runs the self-check)
 --
--- Install:  wget run <url> colony_monitor   (then run `colony_monitor`)
+-- Controls:
+--   * tap a TAB        -> switch view (or press 1-6 / arrow keys on a computer)
+--   * tap footer < / > -> page the list (or left/right half of the footer)
+--   * on Research view -> tap a branch line to expand / collapse it
 --===========================================================================
-
--- pull in the standard CC:Tweaked globals we rely on (keeps luacheck happy)
-local term, colors, keys, peripheral, os, string, math, table, pairs, ipairs, tostring, tonumber, type, error
-    = term, colors, keys, peripheral, os, string, math, table, pairs, ipairs, tostring, tonumber, type, error
-local unpack = unpack or table.unpack   -- Lua 5.1 has global unpack; be safe
 
 local CLI = { ... }   -- program args; "test" runs the self-check instead of main
+
+--===========================================================================
+--  GLOBALS  (local-captured for speed + lint)
+--===========================================================================
+local term, colors, keys, peripheral, os, string, math, table, pairs,
+      ipairs, tostring, tonumber, type, error, unpack =
+      term, colors, keys, peripheral, os, string, math, table, pairs,
+      ipairs, tostring, tonumber, type, error, unpack or table.unpack
 
 --===========================================================================
 -- CONFIG  ·  tweak to taste
@@ -35,7 +36,6 @@ local CONFIG = {
     buildingBlacklist = { "stash", "postbox" },  -- hide these from the Buildings view (substring match on name/type)
     -- control-room extras -------------------------------------------------
     stuckPolls     = 12,    -- refreshes a request stays unresolved before flagged STUCK (x refreshInterval s)
-    historyMax     = 60,    -- how many refresh samples the trend sparklines keep
     -- building types (substring, case-insensitive) that employ citizens.
     -- Used by the Action Board / Workforce view to spot empty worker buildings.
     -- ponytail: maintained by hand; unknown worker types just won't be flagged.
@@ -132,41 +132,6 @@ end
 -- right-align text ending at column xRight
 local function writeRight(xRight, y, text, fg, bg)
     writeAt(xRight - #text + 1, y, text, fg, bg)
-end
-
--- pure sparkline builder: returns an ASCII string (<= w chars) whose shading
--- tracks the value series. ASCII-only so it renders on any CC:T font.
--- ponytail: auto-ranges to the visible window, so a flat line still prints full width.
-local SPARK = { ' ', '.', ':', '-', '=', '#' }   -- 6 levels, low -> high
-local function sparkString(w, values)
-    if w <= 0 then return "" end
-    local n = #values
-    if n == 0 then return string.rep(' ', w) end
-    local mn, mx = math.huge, -math.huge
-    for _, v in ipairs(values) do
-        v = tonumber(v) or 0
-        if v < mn then mn = v end
-        if v > mx then mx = v end
-    end
-    if mx <= mn then                                       -- flat series: visible steady line, not blank
-        return string.rep(SPARK[math.floor(#SPARK / 2) + 1], w)
-    end
-    local start = (n > w) and (n - w + 1) or 1      -- show the most recent w samples
-    local cols  = n - start + 1
-    local out = string.rep(' ', w - cols)           -- left-pad so newest sits at the right
-    for i = 1, cols do
-        local v = tonumber(values[start + i - 1]) or 0
-        local idx = math.floor(((v - mn) / (mx - mn)) * (#SPARK - 1) + 0.5) + 1
-        idx = clamp(idx, 1, #SPARK)
-        out = out .. SPARK[idx]
-    end
-    assert(#out == w, "sparkline width drift")    -- ponytail: shape invariant
-    return out
-end
-
--- sparkline renderer wrapper
-local function sparkline(x, y, w, values, fg)
-    writeAt(x, y, sparkString(w, values), fg)
 end
 
 -- horizontal gauge bar; ratio clamped 0..1
@@ -643,34 +608,6 @@ local function buildBranches(research)
 end
 
 --===========================================================================
--- TREND HISTORY  ·  rolling buffer powering the dashboard sparklines
---===========================================================================
-local History = { samples = {}, max = CONFIG.historyMax }
-
-function History.push(d)
-    if not d then return end
-    local flags = Colony.citizenFlags()
-    local popRatio = (d.maxCitizens and d.maxCitizens > 0)
-        and (d.citizens or 0) / d.maxCitizens or 0
-    local s = History.samples
-    s[#s + 1] = {
-        happiness = tonumber(d.happiness) or 0,
-        requests  = #asTable(d.requests),
-        popRatio  = popRatio,
-        idle      = flags.idle,
-        hungry    = flags.hungry,
-    }
-    while #s > History.max do table.remove(s, 1) end
-end
-
--- return a plain numeric series for one metric ("happiness"/"requests"/"popRatio")
-function History.series(name)
-    local out = {}
-    for _, e in ipairs(History.samples) do out[#out + 1] = e[name] or 0 end
-    return out
-end
-
---===========================================================================
 -- STUCK-REQUEST TRACKER  ·  flags requests that never resolve
 -- Keys each non-complete request by (source|item|state) and ages it across
 -- polls; anything present for >= CONFIG.stuckPolls refreshes is "stuck".
@@ -855,26 +792,6 @@ local function viewDashboard(bodyY)
     wline("Idle",     tostring(flags.idle),   flags.idle > 0 and THEME.warn)
     wline("Hungry",   tostring(flags.hungry), flags.hungry > 0 and THEME.bad)
     ry = railNext(ry, 1, 4)
-
-    -- TRENDS: sparkline strip of recent history (happiness / requests / pop)
-    if ry < H - 3 then
-        local _, ty1 = card(railX, ry, railW, 1, 3, "TRENDS", RH)
-        local spX = railX + 6
-        local spW = railW - 12          -- leave room for label + trailing value
-        if spW < 4 then spW = 4 end
-        local function trendRow(yy, label, series, curTxt, col)
-            writeAt(railX + 1, yy, label, THEME.dim)
-            sparkline(spX, yy, spW, series, col)
-            writeRight(railX + railW - 2, yy, curTxt, THEME.text)
-        end
-        trendRow(ty1,     "MOOD", History.series("happiness"),
-            string.format("%.1f", d.happiness or 0), ratioColour(Colony.happinessRatio()))
-        trendRow(ty1 + 1, "REQ",  History.series("requests"),
-            tostring(#(d.requests or {})), THEME.warn)
-        trendRow(ty1 + 2, "POP",  History.series("popRatio"),
-            tostring(d.citizens or 0), THEME.accent)
-        ry = railNext(ry, 1, 3)
-    end
 
     -- VISITORS: recruitment opportunity + recruit cost
     if ry < H - 1 then
@@ -1391,7 +1308,7 @@ local function viewAction(bodyY)
     }
     local rows = {}
     for _, it in ipairs(items) do
-        rows[#rows + 1] = { sevTag[it._sev] or " ", it.text, _sev = it.sev }
+        rows[#rows + 1] = { sevTag[it.sev] or " ", it.text, _sev = it.sev }
     end
     drawTable(2, bodyY + 2, W - 2, H - bodyY - 3, columns, rows, VI.ACTION)
 end
@@ -1625,9 +1542,8 @@ local function main()
 
     Colony.init()
 
-    -- initial poll + draw + seed history
+    -- initial poll + draw
     Colony.refresh()
-    History.push(Colony.data)
     Stuck.refresh(Colony.data and Colony.data.requests or {})
     render()
 
@@ -1637,7 +1553,6 @@ local function main()
         local e = event[1]
         if e == "timer" and event[2] == timer then
             Colony.refresh()
-            History.push(Colony.data)
             Stuck.refresh(Colony.data and Colony.data.requests or {})
             render()
             timer = os.startTimer(CONFIG.refreshInterval)
@@ -1669,24 +1584,13 @@ end
 
 --===========================================================================
 -- SELF-CHECK  ·  `colony_monitor test` validates the pure-logic extras
--- (sparkline shaping + stuck-request aging) without a colony or monitor.
+-- (stuck-request aging) without a colony or monitor.
 --===========================================================================
 local function _selftest()
     local fail = 0
     local function check(name, cond)
         if cond then print("ok   " .. name) else print("FAIL " .. name); fail = fail + 1 end
     end
-
-    -- sparkline: rising series should peak at the newest (rightmost) sample
-    local rising = sparkString(6, { 1, 2, 3, 4, 5, 6 })
-    check("spark rising peaks at right", rising:sub(-1) == "#")
-    check("spark width is exact", #rising == 6)
-    -- flat series fills width with a visible (non-blank) steady line
-    local flat = sparkString(5, { 7, 7, 7, 7, 7 })
-    check("spark flat fills width", #flat == 5)
-    check("spark flat is visible", flat:sub(1, 1) ~= " ")
-    -- empty series returns a blank strip of the requested width
-    check("spark empty is blank", sparkString(4, {}) == "    ")
     -- stuck tracker: 11 polls under threshold, 12th trips, then clears
     Stuck.sigs, Stuck.poll = {}, 0
     Colony.resolveSource = function(raw) return tostring(raw or "?") end
