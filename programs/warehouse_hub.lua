@@ -344,6 +344,8 @@ if not monitor then
 end
 monitor.setTextScale(CONFIG.textScale)
 term.redirect(monitor)
+W, H = term.getSize()
+W, H = W or 51, H or 19   -- ponytail: sane fallback if getSize ever returns nil
 
 local modemSide = findModemSide()
 if not modemSide then
