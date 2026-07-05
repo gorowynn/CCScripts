@@ -115,19 +115,13 @@ rednet.host(CONFIG.PROT, CONFIG.HOST_NAME)
 
 if monitor then
     monitor.setTextScale(CONFIG.SCALE)
-    out = monitor
-    term.redirect(monitor)
-else
-    out = term
 end
+out = monitor or term
 
--- terminal message before handing the screen to the monitor view
-if monitor then term.restore() end
 print(("warehouse_hub: hosting '%s' on protocol '%s'. %s")
       :format(CONFIG.HOST_NAME, CONFIG.PROT,
               monitor and "Rendering on monitor." or "No monitor; terminal only."))
 print("Listening for warehouse_node reports...")
-if monitor then term.redirect(monitor) end
 
 render()
 
@@ -157,6 +151,5 @@ local ok, err = pcall(function()
     parallel.waitForAny(listenNet, listenKeys, tick)
 end)
 
-if monitor then term.restore() end
 rednet.unhost(CONFIG.PROT, CONFIG.HOST_NAME)
 if not ok then printError(tostring(err)) end
