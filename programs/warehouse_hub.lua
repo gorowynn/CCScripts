@@ -244,15 +244,24 @@ local function buildRows()
                     end
                     local mlist = {}
                     for _, e in pairs(mods) do mlist[#mlist + 1] = e end
-                    table.sort(mlist, function(a, b) return a.total > b.total end)
+                    table.sort(mlist, function(a, b)
+                        if a.name == "other" then return false end
+                        if b.name == "other" then return true end
+                        return a.total > b.total
+                    end)
                     for _, e in ipairs(mlist) do
                         table.sort(e.items, function(a, b) return (a.count or 0) > (b.count or 0) end)
+                        local mk = name .. "\\" .. g.name .. "\\" .. e.name
+                        local mopen = app.expanded[mk]
                         rows[#rows + 1] = { kind = "modsub",
-                            text = e.name, total = e.total, types = #e.items }
-                        for _, it in ipairs(e.items) do
-                            rows[#rows + 1] = { kind = "item",
-                                text = humanize(it.name or it.id),
-                                count = it.count or 0, max = g.max }
+                            text = e.name, total = e.total, types = #e.items,
+                            key = mk, open = mopen }
+                        if mopen then
+                            for _, it in ipairs(e.items) do
+                                rows[#rows + 1] = { kind = "item",
+                                    text = humanize(it.name or it.id),
+                                    count = it.count or 0, max = g.max }
+                            end
                         end
                     end
                 else
@@ -346,10 +355,12 @@ local function render()
             fillRow(1, y, 1, THEME.faint)  -- left rail tick
             ui.touch[#ui.touch + 1] = { y = y, key = r.key }
         elseif r.kind == "modsub" then
-            -- Misc sub-header: indented mod namespace, non-touch
-            writeAt(3, y, ".", THEME.faint)
-            writeAt(5, y, string.lower(r.text), THEME.dim)
-            writeRight(W - 2, y, string.format("%d / %d t", r.total, r.types), THEME.faint)
+            -- Misc sub-header: indented mod namespace, touch-collapsible
+            local mark = r.open and "-" or "+"
+            writeAt(3, y, mark, r.open and THEME.warn or THEME.good)
+            writeAt(5, y, string.lower(r.text), THEME.text)
+            writeRight(W - 2, y, string.format("%d / %d t", r.total, r.types), THEME.dim)
+            ui.touch[#ui.touch + 1] = { y = y, key = r.key }
         else -- item
             local cnt = tostring(r.count)
             local col = r.max > 0 and ratioColour(r.count / r.max) or THEME.text
