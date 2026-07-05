@@ -160,6 +160,11 @@ local function categoryOf(id)
     return "Misc"
 end
 
+-- namespace of a registry id: "minecraft:oak_log" -> "minecraft"
+local function modOf(id)
+    return tostring(id):match("^(%w+):") or "other"
+end
+
 --===========================================================================
 --  STATE
 --===========================================================================
@@ -227,10 +232,35 @@ local function buildRows()
             rows[#rows + 1] = { kind = "group", key = key, gname = g.name,
                                 total = g.total, types = g.types, open = open }
             if open then
-                for _, it in ipairs(g.items) do
-                    rows[#rows + 1] = { kind = "item",
-                        text = humanize(it.name or it.id),
-                        count = it.count or 0, max = g.max }
+                if g.name == "Misc" then
+                    -- Misc expands into mod-namespace subgroups
+                    local mods = {}
+                    for _, it in ipairs(g.items) do
+                        local m = modOf(it.id)
+                        local e = mods[m]
+                        if not e then e = { name = m, items = {}, total = 0 }; mods[m] = e end
+                        e.items[#e.items + 1] = it
+                        e.total = e.total + (it.count or 0)
+                    end
+                    local mlist = {}
+                    for _, e in pairs(mods) do mlist[#mlist + 1] = e end
+                    table.sort(mlist, function(a, b) return a.total > b.total end)
+                    for _, e in ipairs(mlist) do
+                        table.sort(e.items, function(a, b) return (a.count or 0) > (b.count or 0) end)
+                        rows[#rows + 1] = { kind = "modsub",
+                            text = e.name, total = e.total, types = #e.items }
+                        for _, it in ipairs(e.items) do
+                            rows[#rows + 1] = { kind = "item",
+                                text = humanize(it.name or it.id),
+                                count = it.count or 0, max = g.max }
+                        end
+                    end
+                else
+                    for _, it in ipairs(g.items) do
+                        rows[#rows + 1] = { kind = "item",
+                            text = humanize(it.name or it.id),
+                            count = it.count or 0, max = g.max }
+                    end
                 end
             end
         end
@@ -315,6 +345,11 @@ local function render()
             writeRight(W - 2, y, right, THEME.dim)
             fillRow(1, y, 1, THEME.faint)  -- left rail tick
             ui.touch[#ui.touch + 1] = { y = y, key = r.key }
+        elseif r.kind == "modsub" then
+            -- Misc sub-header: indented mod namespace, non-touch
+            writeAt(3, y, ".", THEME.faint)
+            writeAt(5, y, string.lower(r.text), THEME.dim)
+            writeRight(W - 2, y, string.format("%d / %d t", r.total, r.types), THEME.faint)
         else -- item
             local cnt = tostring(r.count)
             local col = r.max > 0 and ratioColour(r.count / r.max) or THEME.text
