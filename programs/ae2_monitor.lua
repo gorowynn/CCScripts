@@ -156,14 +156,28 @@ local function fmtNum(n)
     else s = string.format("%.2f", n):gsub("%.?0+$", "") end
     return (neg and "-" or "") .. s .. suffix[i]
 end
-local function fmtSigned(n)
+-- adaptive-decimal rate formatting: <1 -> 0.00, <10 -> 0.0, else integer.
+-- no k/M suffix (rates read better raw). Ponytail: magnitude-banded precision.
+local function fmtRate(n)
     n = tonumber(n) or 0
-    return (n >= 0 and "+" or "") .. fmtNum(n)
+    local a = math.abs(n)
+    if a < 1 then return string.format("%.2f", n) end
+    if a < 10 then return string.format("%.1f", n) end
+    return string.format("%.0f", n)
+end
+-- direction arrow for a signed flow value (net). \226\134\145 = ↑, \226\134\147 = ↓
+local function arrowOf(n)
+    n = tonumber(n) or 0
+    if n > 0.005 then return "\226\134\145" end   -- rising
+    if n < -0.005 then return "\226\134\147" end  -- falling
+    return "-"                                       -- stable
 end
 local function fmtEnergy(n) return fmtNum(n) .. " AE" end
 
 -- truncate text to width with an ellipsis char (\187 = >>)
 local function trunc(s, w)
+    s = tostring(s or "")
+    w = tonumber(w) or 0
     if #s <= w then return s end
     if w < 2 then return s:sub(1, w) end
     return s:sub(1, w - 1) .. "\187"
@@ -189,6 +203,15 @@ local function safeCall(method, ...)
     return nil
 end
 
+-- try a list of method names; return first non-nil raw result
+local function tryMethods(names, ...)
+    for _, m in ipairs(names) do
+        local r = safeCall(m, ...)
+        if r ~= nil then return r end
+    end
+    return nil
+end
+
 local function avgOf(res)
     if res == nil then return nil end
     if type(res) == "number" then return res end
@@ -204,10 +227,25 @@ local function snapshot()
     local items  = safeCall("listItems")   or safeCall("getItems")   or {}
     local fluids = safeCall("listFluids")  or safeCall("getFluids")  or {}
     local craft  = safeCall("listCraftables") or safeCall("getCraftables") or {}
-    local energy    = safeCall("getEnergy")    or 0
-    local maxEnergy = safeCall("getMaxEnergy") or safeCall("getMaxStorage") or 0
-    local pinj = avgOf(safeCall("getAvgPowerInjection"))
-    local puse = avgOf(safeCall("getAvgPowerUsage"))
+    local energy    = tonumber(tryMethods({ "getEnergy", "getEnergyStored", "getStoredEnergy", "getCurrentAmpere", "getStoredPower" })) or 0
+    local maxEnergy = tonumber(tryMethods({ "getMaxEnergy", "getMaxEnergyStored", "getMaxStoredPower", "getMaxStorage", "getStoredMaxEnergy" })) or 0
+    -- ponytail: AP renamed avg-power methods across versions; try them all.
+    local pinj = avgOf(tryMethods({
+        "getAvgPowerInjection", "getAveragePowerInjection", "getAvgInjection",
+        "getPowerInjection", "getInjection", "getInputRate",
+    }))
+    local puse = avgOf(tryMethods({
+        "getAvgPowerUsage", "getAveragePowerUsage", "getAvgUsage",
+        "getPowerUsage", "getUsage", "getOutputRate",
+    }))
+    -- some builds bury power inside getConfiguration()
+    if pinj == nil and puse == nil then
+        local cfg = safeCall("getConfiguration")
+        if type(cfg) == "table" then
+            pinj = avgOf(cfg.avgInjection or cfg.powerInjection or cfg.injection)
+            puse = avgOf(cfg.avgUsage  or cfg.powerUsage  or cfg.usage)
+        end
+    end
     local usedItem  = safeCall("getUsedItemStorage")
     local totalItem = safeCall("getTotalItemStorage")
     local usedFluid  = safeCall("getUsedFluidStorage")
@@ -266,11 +304,14 @@ local history = { items = {}, fluids = {} }
 local meta = { items = {}, fluids = {} }   -- meta[kind][key] = { display, cur }
 local prev = { items = nil, fluids = nil }
 local sinceStart = os.epoch("utc")  -- ponytail: retained for future uptime display
+-- energy ring (for deriving NET AE/t when the bridge lacks avg-power methods)
+local energyHist = {}   -- oldest..newest { t=ms, e=energy }
 
 local function resetCounters()
     history = { items = {}, fluids = {} }
     meta    = { items = {}, fluids = {} }
     prev    = { items = nil, fluids = nil }
+    energyHist = {}
     sinceStart = os.epoch("utc")
 end
 
@@ -368,6 +409,34 @@ local function topBy(kind, sortField, n)
     return list
 end
 
+-- push energy sample into the ring; trim to window
+local function pushEnergy(e, nowMs)
+    energyHist[#energyHist + 1] = { t = nowMs, e = tonumber(e) or 0 }
+    local cutoff = nowMs - CONFIG.windowSec * 1000
+    while #energyHist > 2 and energyHist[1].t < cutoff do table.remove(energyHist, 1) end
+end
+
+-- NET AE/t from energy deltas (fallback when bridge lacks avg-power methods)
+local function netPowerFromEnergy()
+    if #energyHist < 2 then return nil end
+    local dt = (energyHist[#energyHist].t - energyHist[1].t) / 1000
+    if dt <= 0 then return nil end
+    return (energyHist[#energyHist].e - energyHist[1].e) / dt
+end
+
+-- resolve {inj, use, net} for a snapshot: prefers bridge avg-power; falls back
+-- to energy-delta for net. Each field may be nil if not derivable.
+local function resolvePower(s)
+    local inj, use = s.pinj, s.puse
+    local net
+    if inj or use then
+        net = (inj or 0) - (use or 0)
+    else
+        net = netPowerFromEnergy()
+    end
+    return inj, use, net
+end
+
 --===========================================================================
 --  APP / UI STATE
 --===========================================================================
@@ -391,9 +460,11 @@ local function poll()
     local ok, s = pcall(snapshot)
     if not ok then lastError = tostring(s); return end
     lastError = nil
-    applySnapshot(s, os.epoch("utc"))
+    local now = os.epoch("utc")
+    applySnapshot(s, now)
+    pushEnergy(s.energy, now)
     curSnap = s
-    lastPollAt = os.epoch("utc")
+    lastPollAt = now
 end
 
 --===========================================================================
@@ -481,7 +552,10 @@ local function leaderboardColumn(x, y, colW, listH, title, list, startIdx, valFi
             writeAt(x, yy, string.format("%2d.", idx), THEME.faint)
             local nameMax = colW - 10
             writeAt(x + 4, yy, trunc(e.display, nameMax), THEME.text)
-            writeRight(x + colW - 1, yy, fmtNum(fieldValue(e, valField)) .. valUnit, valCol)
+            local v = fieldValue(e, valField)
+            -- ponytail: STORED is a count (k/M suffix); rates use adaptive decimals
+            local s = (valField == "cur") and fmtNum(v) or fmtRate(v)
+            writeRight(x + colW - 1, yy, s .. valUnit, valCol)
         end
     end
 end
@@ -515,15 +589,19 @@ local function viewDashboard(bodyY)
     ry = statRow(railX, ry, railW, "ENERGY", fmtEnergy(s.energy), ratioColour(er))
     gauge(railX, ry, railW, er, ratioColour(er), THEME.faint); ry = ry + 2
 
-    -- power
+    -- power: prefer bridge avg-power; fall back to energy-delta for NET
+    local pinj, puse, pnet = resolvePower(s)
     ry = statRow(railX, ry, railW, "POWER IN",
-        s.pinj and (fmtNum(s.pinj) .. " AE/t") or "--", THEME.incol)
+        pinj and (fmtNum(pinj) .. " AE/t") or "--", THEME.incol)
     ry = statRow(railX, ry, railW, "POWER OUT",
-        s.puse and (fmtNum(s.puse) .. " AE/t") or "--", THEME.outcol)
-    local net = (s.pinj or 0) - (s.puse or 0)
-    ry = statRow(railX, ry, railW, "NET",
-        string.format("%s%.1f AE/t", net >= 0 and "+" or "-", math.abs(net)),
-        net >= 0 and THEME.good or THEME.bad)
+        puse and (fmtNum(puse) .. " AE/t") or "--", THEME.outcol)
+    if pnet ~= nil then
+        ry = statRow(railX, ry, railW, "NET",
+            string.format("%s%.1f AE/t", pnet >= 0 and "+" or "-", math.abs(pnet)),
+            pnet >= 0 and THEME.good or THEME.bad)
+    else
+        ry = statRow(railX, ry, railW, "NET", "--", THEME.faint)
+    end
     ry = ry + 1
 
     writeAt(railX, ry, "[ STORAGE ]", THEME.accent); ry = ry + 1
@@ -573,10 +651,10 @@ local function viewDashboard(bodyY)
             if my > H - 1 then break end
             local e = movers[i]
             writeAt(rightX, my, trunc(e.display, nameW), THEME.text)
-            writeRight(rightX + nameW + 4, my, fmtNum(e.inRate) .. "/s", THEME.incol)
-            writeRight(rightX + nameW + 9, my, fmtNum(e.outRate) .. "/s", THEME.outcol)
+            writeRight(rightX + nameW + 4, my, fmtRate(e.inRate) .. "/s", THEME.incol)
+            writeRight(rightX + nameW + 9, my, fmtRate(e.outRate) .. "/s", THEME.outcol)
             local ncol = e.netRate >= 0 and THEME.good or THEME.bad
-            writeRight(rightX + rightW - 1, my, fmtSigned(e.netRate) .. "/s", ncol)
+            writeRight(rightX + rightW - 1, my, arrowOf(e.netRate) .. fmtRate(math.abs(e.netRate)) .. "/s", ncol)
             my = my + 1
         end
     end
@@ -619,10 +697,10 @@ local function viewMovers(bodyY)
             if e then
                 writeAt(x, yy, string.format("%2d.", idx), THEME.faint)
                 writeAt(x + 4, yy, trunc(e.display, nameW), THEME.text)
-                writeRight(x + nameW + 5,  yy, fmtNum(e.inRate) .. "/s", THEME.incol)
-                writeRight(x + nameW + 10, yy, fmtNum(e.outRate) .. "/s", THEME.outcol)
+                writeRight(x + nameW + 5,  yy, fmtRate(e.inRate) .. "/s", THEME.incol)
+                writeRight(x + nameW + 10, yy, fmtRate(e.outRate) .. "/s", THEME.outcol)
                 local ncol = e.netRate >= 0 and THEME.good or THEME.bad
-                writeRight(x + nameW + 16, yy, fmtSigned(e.netRate) .. "/s", ncol)
+                writeRight(x + nameW + 16, yy, arrowOf(e.netRate) .. fmtRate(math.abs(e.netRate)) .. "/s", ncol)
             end
         end
     end
@@ -638,13 +716,14 @@ local function viewLeaderboard(kind)
     local colW = math.floor((W - 3) / 3)
     local xs = { 2, colW + 3, 2 * (colW + 1) + 1 }
     local listH = bodyH - 1
-    local unit = (kind == "fluids") and "/s mB" or "/s"
+    local rateUnit   = (kind == "fluids") and "mB/s" or "/s"
+    local storedUnit = (kind == "fluids") and "mB" or "x"
     local viewIdx = (kind == "fluids") and VI.FLUIDS or VI.ITEMS
 
     local colDefs = {
-        { title = "TOP IN/s",    field = "in", col = THEME.incol },
-        { title = "TOP OUT/s",   field = "out", col = THEME.outcol },
-        { title = "TOP STORED",  field = "cur", col = THEME.viewAccent[viewIdx] },
+        { title = "TOP IN/s",    field = "in",  unit = rateUnit,   col = THEME.incol },
+        { title = "TOP OUT/s",   field = "out", unit = rateUnit,   col = THEME.outcol },
+        { title = "TOP STORED",  field = "cur", unit = storedUnit, col = THEME.viewAccent[viewIdx] },
     }
     local lists = {}
     local total = 0
@@ -658,7 +737,7 @@ local function viewLeaderboard(kind)
 
     for ci, d in ipairs(colDefs) do
         leaderboardColumn(xs[ci], bodyY, colW, listH, d.title, lists[ci],
-                          startIdx, d.field, unit, d.col)
+                          startIdx, d.field, d.unit, d.col)
     end
 end
 
