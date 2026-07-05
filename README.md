@@ -76,6 +76,54 @@ to pan the tree (arrows appear at the edges when there's more to see).
 interval, monitor/colony side overrides, text scale (0.5 = dense, good for a
 wall of monitors), and an optional friendly colony name.
 
+### `programs/ae2_monitor.lua` — AE2 / Extended AE2 Network Monitor
+
+A SCADA dashboard for an Applied Energistics 2 (and Extended AE2) ME network.
+Polls the **Advanced Peripherals** `me_bridge` every few seconds and renders
+four touch-driven views on an Advanced Monitor:
+
+- **Overview** — energy bar, avg power in/out (AE/t) and net, item-type count,
+  fluid-type count, item/fluid byte storage (with gauge when the bridge exposes
+  it), and a current top-5 by stored amount.
+- **Top Items** — three side-by-side leaderboards since start: **Top IN**, **Top
+  OUT**, **Top STORED**. In/out is computed by diffing per-item stored counts
+  between polls and accumulating the deltas. Press **`R`** (or the `R` key) to
+  reset the counters.
+- **Top Fluids** — same three leaderboards for fluids (mB).
+- **Crafting** — every craftable item, flagged `crafting` when the bridge
+  reports an active job (queried for the first 20 rows to stay cheap).
+
+**Requirements:**
+
+| Component | |
+| --- | --- |
+| Minecraft | 1.21.1 |
+| CC:Tweaked | 1.21.1 |
+| Applied Energistics 2 | (any recent 1.21.1 build; Extended AE2 supported) |
+| Advanced Peripherals | 0.7.61+ (`me_bridge` peripheral) |
+| Hardware | 1× **Advanced Monitor** (touch-capable, for colour) + a Computer adjacent to (or wired onto) the ME network via a `me_bridge` |
+
+**Setup:**
+
+1. Place an **Advanced Monitor** next to (or wired to) the computer.
+2. Place a **`me_bridge`** (Advanced Peripherals) adjacent to the computer and
+   connected to your ME network (cable to a controller / dense conduit).
+3. Download and run:
+
+   ```lua
+   wget run https://raw.githubusercontent.com/<owner>/CCScripts/main/programs/ae2_monitor.lua ae2_monitor
+   ae2_monitor
+   ```
+
+**Controls:** tap the **tabs** to switch views; tap **`<` / `>`** footer (or
+the left/right half of the footer) to page leaderboards; **`R`** key resets
+in/out counters; **`r`** redraws, **`q`** quits.
+
+**Tuning:** edit the `CONFIG` table at the top — `poll` (delta window in
+seconds), `refresh` (frame redraw interval), `textScale`, `monitorSide` /
+`bridgeSide` overrides, and `topN` leaderboard size. In/out counters are
+in-memory only and reset on restart — add disk logging if you need history.
+
 ## Installing a script in-game
 
 From a Computer/Turtle shell, download a script with `wget` and make it runnable:
