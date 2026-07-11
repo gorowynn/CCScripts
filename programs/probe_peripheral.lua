@@ -11,6 +11,8 @@
 --   probe_peripheral left                 -- probe a specific side/wired name
 --   probe_peripheral back refinery        -- side + a type keyword to match
 --
+--   Output is also saved to probe_<target>.txt next to this script.
+--
 -- Nothing readable? The block isn't a CC:T peripheral. Either place the
 -- computer adjacent to it, attach a Wired Modem + cable (right-click modem to
 -- connect), or -- if still nothing -- the mod doesn't expose it at all and you
@@ -19,7 +21,9 @@
 -- Hardware: Computer + the target block adjacent or on a wired network.
 --===========================================================================
 
--- ponytail: no config, no globals beyond stdlib -- it's a one-shot diagnostic.
+-- ponytail: one-shot diagnostic. Output is tee'd to a log file by reassigning
+-- the global print/printError once (cheaper than threading a logger through ~40
+calls). Ceiling: the reassignment is process-wide -- fine for a diagnostic.
 
 local args = { ... }
 local keyword = args[2] or "refinery"   -- type substring to match in auto mode
@@ -151,6 +155,43 @@ local function probe(name)
     sep("=")
 end
 
+---------------------------------------------------------------- output tee
+-- ponytail: capture every print()/printError() line into a buffer AND echo it
+-- to the terminal, then flush to disk at the end. One global swap beats
+-- editing every call site.
+local LOG_LINES, LOG_TARGET = {}, nil
+local BUILTIN_PRINT = print
+local BUILTIN_ERROR = printError
+
+local function joinArgs(...)
+    local t, parts = {...}, {}
+    for i = 1, #t do parts[i] = tostring(t[i]) end
+    return table.concat(parts, "\t")
+end
+print = function(...)
+    local s = joinArgs(...)
+    BUILTIN_PRINT(s)
+    LOG_LINES[#LOG_LINES + 1] = s
+end
+printError = function(...)
+    local s = joinArgs(...)
+    BUILTIN_ERROR(s)
+    LOG_LINES[#LOG_LINES + 1] = "[error] " .. s
+end
+
+local function saveLog()
+    local base = LOG_TARGET and tostring(LOG_TARGET):gsub("[^%w_.-]", "_") or "output"
+    local path = "probe_" .. base .. ".txt"
+    local f = fs.open(path, "w")
+    if not f then
+        BUILTIN_PRINT("Could not write log to " .. path)
+        return
+    end
+    f.write(table.concat(LOG_LINES, "\n"))
+    f.close()
+    BUILTIN_PRINT("\nLog written to: " .. path)
+end
+
 ---------------------------------------------------------------- main
 local function main()
     local name = args[1]
@@ -179,7 +220,9 @@ local function main()
         end
     end
 
+    LOG_TARGET = name
     probe(name)
 end
 
 main()
+saveLog()
